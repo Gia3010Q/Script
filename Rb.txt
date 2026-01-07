@@ -1,0 +1,1 @@
+loadstring(game:HttpGet('https://raw.githubusercontent.com/Space-RB/Script/refs/heads/main/loader.lua'))()

@@ -1,0 +1,11 @@
+script_key="DrrFFBkzkirvIxbGsNiWKjohUdAosKaf";
+getgenv().Config = {
+    HUDHopMinGain = 50,     -- Tokens                    -- Minimum snow tokens collected (in 10 minutes)
+    HUDHopWindowSec = 900,  -- Second                    --
+    FPSCap     = 10,                                      -- Best fps optimized, can change if you want! (recommend 5 fps+)
+    Mode       = "battlepass",                     -- "battlepass" or "crate" or "mysterybox"
+    Webhook    = "your_webhook_here",                    -- Crate notify
+    DiscordID  = "put_your_discord_id_here"              -- Crate notify (need metion)
+}
+-- USE THE CORRECT LOADSTRING FOR YOUR NUMBER OF TABS!
+loadstring(game:HttpGet("https://api.luarmor.net/files/v3/loaders/fbdaaeddcf4c27445764a37ba601f35a.lua"))() -- 120 TABS
