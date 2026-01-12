@@ -1,4 +1,4 @@
-script_key="DrrFFBkzkirvIxbGsNiWKjohUdAosKaf";
+script_key="TcpVsbuJmQtDEwhgBtEQbJFUgKxAsEAk";
 getgenv().Config = {
     HUDHopMinGain = 50,     -- Tokens                    -- Minimum snow tokens collected (in 10 minutes)
     HUDHopWindowSec = 900,  -- Second                    --
