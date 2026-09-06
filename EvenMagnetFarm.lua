@@ -49,6 +49,8 @@ local config = {
     FruitScanInterval = 1, FruitPickupDistance = 6, FruitPickupConfirm = 2,
     FruitPickupAttempts = 3, FruitRetryDelay = 60,
     StoreFruit = true, StoreRetryDelay = 15, StoreAttempts = 3,
+    BringMobs = true, BringMobCount = 2, BringMobRadius = 200,
+    BringActivationRange = 50, BringPlayerSafeRange = 300, BringMobInterval = 0.1,
     StartupHop = true, StartupDelay = 5, CurrentPlayerLimit = 4,
     TargetExistingPlayers = 3, HopMaxPages = 30, HopCandidates = 3,
     HopRequestRetries = 3, HopRetryDelay = 60, HopTeleportTimeout = 10,
@@ -857,22 +859,29 @@ local function startStore(item, force)
             return commF:InvokeServer("StoreFruit", storageName, item)
         end)
         if not actionIsCurrent("store", token) then return end
-        local deadline = os.clock() + 1.5
+        -- auto_factory: wait briefly for the Tool to leave the inventory.
+        local deadline = os.clock() + 0.5
         while actionIsCurrent("store", token) and os.clock() < deadline do task.wait(0.1) end
         if not actionIsCurrent("store", token) then return end
         local after = inventoryFruitCount(commF, storageName)
         if not actionIsCurrent("store", token) then return end
-        local confirmed = ok and (responseConfirmsStore(response)
+        local backpack = player:FindFirstChild("Backpack")
+        local stillOwned = item.Parent and ((backpack and item:IsDescendantOf(backpack))
+            or (player.Character and item:IsDescendantOf(player.Character)))
+        local confirmed = ok and not stillOwned and (responseConfirmsStore(response)
             or (before ~= nil and after ~= nil and after > before))
         if confirmed then
             record.blocked, record.last = false, "Da luu xac nhan"
             record.retryAt, record.attempts = os.clock() + config.StoreRetryDelay, 0
             log("STORE", short(item.Name, 80) .. ": da luu")
         else
-            local permanent = ok and responseRejectsStore(response)
-            record.blocked = permanent or record.attempts >= config.StoreAttempts
+            -- Ported from auto_factory: a completed call with a remaining Tool
+            -- is skipped for this instance; transport failures remain retryable.
+            local permanent = ok and (stillOwned or responseRejectsStore(response))
+            record.blocked = permanent or false
             record.retryAt = os.clock() + config.StoreRetryDelay
-            record.last = ok and "Chua xac nhan luu" or short(response, 100)
+            record.last = permanent and "Bo qua trai khong luu duoc (Tool nay)"
+                or (ok and "Chua xac nhan luu" or short(response, 100))
             log("STORE", short(item.Name, 80) .. ": " .. record.last
                 .. (record.blocked and "; chan hop" or "; se thu lai"))
         end
@@ -1830,6 +1839,59 @@ local function fruitStep(root, humanoid, dt, now)
     return true
 end
 
+-- Adapted from giayeuem.lua SourceBringMob: same radius/count/throttle and
+-- other-player guard, but only living Magnetized NPCs are eligible.
+local bringState = { at = 0, parts = setmetatable({}, { __mode = "k" }) }
+local function restoreBring()
+    for part, original in pairs(bringState.parts) do
+        if part.Parent then pcall(function() part.CanCollide = original end) end
+    end
+    bringState.parts = setmetatable({}, { __mode = "k" })
+end
+local function bringEventMobs(root, mobRoot, now)
+    if not config.BringMobs or now - bringState.at < config.BringMobInterval then return end
+    bringState.at = now
+    restoreBring()
+    if (root.Position - mobRoot.Position).Magnitude > config.BringActivationRange then return end
+    local function otherPlayerNear(position)
+        for _, other in ipairs(Players:GetPlayers()) do
+            local otherRoot = other ~= player and rootOf(other.Character)
+            if otherRoot and (otherRoot.Position - position).Magnitude <= config.BringPlayerSafeRange then
+                return true
+            end
+        end
+        return false
+    end
+    if otherPlayerNear(mobRoot.Position) then return end
+    local count = 0
+    for _, model in ipairs(targets) do
+        if count >= math.max(math.floor(config.BringMobCount) - 1, 0) then break end
+        local h, r = livingNPC(model)
+        if model ~= target and h and isMagnetized(model, h) and not model:FindFirstChild("Ignored")
+            and (skipped[model] or 0) <= now
+            and (r.Position - mobRoot.Position).Magnitude <= config.BringMobRadius
+            and not otherPlayerNear(r.Position) then
+            local owned = true
+            if type(isnetworkowner) == "function" then
+                local ok, result = pcall(isnetworkowner, r)
+                owned = ok and result == true
+            end
+            if owned then
+                pcall(function()
+                    for _, part in ipairs(model:GetDescendants()) do
+                        if part:IsA("BasePart") then
+                            bringState.parts[part] = part.CanCollide
+                            part.CanCollide = false
+                        end
+                    end
+                    r.AssemblyLinearVelocity, r.AssemblyAngularVelocity = Vector3.zero, Vector3.zero
+                    r.CFrame = mobRoot.CFrame * CFrame.new(0, math.random(0, 2), math.random(0, 2))
+                end)
+                count = count + 1
+            end
+        end
+    end
+end
 local seatGuard = { humanoid = nil, original = nil }
 local function restoreSeatGuard()
     if seatGuard.humanoid and seatGuard.humanoid.Parent then
@@ -2026,6 +2088,7 @@ local function farmStep(dt)
         return
     end
     flyTo(root, humanoid, destination, dt, mobRoot.Position)
+    bringEventMobs(root, mobRoot, now)
     status = "Farm " .. short(target.Name, 65) .. " | HP " .. math.ceil(mobHumanoid.Health)
     attackClock = attackClock + dt
     if distance <= config.AttackRange and attackClock >= config.AttackInterval then
@@ -2231,7 +2294,8 @@ header.BackgroundTransparency = 1
 header.Active = true
 header.Parent = panel
 
-local titleLabel = text(header, "MAGNETIZED FARM | 190 default", 14, 6, 270, 32, 14, C.text, true)
+local titleLabel = text(header, "MAGNETIZED FARM", 14, 3, 270, 23, 14, C.text, true)
+text(header, "Dev By Gia Yêu Em", 14, 26, 270, 15, 11, C.muted, false)
 local onDot = text(header, "●", 292, 7, 18, 30, 14, C.green, true, Enum.TextXAlignment.Center)
 local onLabel = text(header, "ON", 309, 7, 34, 30, 12, C.green, true, Enum.TextXAlignment.Left)
 text(header, "—", 349, 6, 24, 30, 16, C.muted, false, Enum.TextXAlignment.Center)
@@ -2276,8 +2340,7 @@ local function counterRow(parent, x, y, labelText, valueColor)
     return text(parent, "0", x + 98, y, 66, 22, 13, valueColor or C.green, true, Enum.TextXAlignment.Right)
 end
 local magnetizedValue = counterRow(counterCard, 16, 7, "Magnetized", C.green)
-local deliveryValue = counterRow(counterCard, 16, 34, "Nhận", C.green)
-local ownedValue = counterRow(counterCard, 16, 61, "Giữ", C.green)
+local ownedValue = counterRow(counterCard, 16, 34, "Giữ", C.green)
 local eventCountValue = counterRow(counterCard, 210, 7, "Event", C.yellow)
 local fruitMapValue = counterRow(counterCard, 210, 34, "Fruit map", C.yellow)
 local waitBlockValue = counterRow(counterCard, 210, 61, "Chờ/chặn", C.yellow)
@@ -2291,14 +2354,10 @@ text(systemCard, "Hop", 14, 30, 55, 22, 11, C.muted, false)
 text(systemCard, ":", 70, 30, 10, 22, 11, C.muted, false)
 local hopValue = text(systemCard, "Chờ kiểm tra đầu phiên", 84, 30, 294, 22, 11, C.green, true)
 
--- Target and last 3 logs.
-local targetCard = card(12, 332, 194, 88)
-text(targetCard, "TARGET", 12, 5, 170, 18, 10, C.cyan, true)
-local targetLabel = text(targetCard, "-", 12, 25, 170, 56, 11, C.text, false, Enum.TextXAlignment.Left, Enum.TextYAlignment.Top)
-
-local logCard = card(214, 332, 194, 88)
-text(logCard, "LOG (3)", 12, 5, 170, 18, 10, C.cyan, true)
-local logLabel = text(logCard, "-", 12, 25, 170, 56, 10, C.text, false, Enum.TextXAlignment.Left, Enum.TextYAlignment.Top)
+-- Logs remain available through GetLogs(), but are not displayed on the UI.
+local targetCard = card(12, 332, 396, 88)
+text(targetCard, "TRẠNG THÁI", 12, 5, 372, 18, 10, C.cyan, true)
+local targetLabel = text(targetCard, "-", 12, 25, 372, 56, 11, C.text, false, Enum.TextXAlignment.Left, Enum.TextYAlignment.Top)
 
 local function button(parent, labelText, x, w, color)
     local b = Instance.new("TextButton")
@@ -2358,6 +2417,7 @@ function api.Destroy()
     if waterPlatform then waterPlatform:Destroy(); waterPlatform = nil end
     cancelAction("Destroy")
     alive, enabled = false, false
+    restoreBring()
     restoreSeatGuard()
     resetTarget()
     for _, connection in ipairs(connections) do connection:Disconnect() end
@@ -2382,6 +2442,7 @@ connect(player.CharacterAdded, function()
     cancelAction("CharacterAdded"); resetTarget(); scanClock = config.ScanInterval
 end)
 connect(RunService.Stepped, function()
+    if not enabled or not target or action.kind then restoreBring() end
     local ok, err = pcall(updateSeatGuard)
     if not ok and os.clock() - lastError > 5 then
         lastError = os.clock(); log("SEAT", short(err, 100))
@@ -2434,7 +2495,6 @@ connect(RunService.Heartbeat, function(dt)
             areaValue.Text = tostring(visited) .. " / " .. tostring(#patrol.points)
 
             magnetizedValue.Text = tostring(#targets)
-            deliveryValue.Text = tostring(deliveryCount)
             ownedValue.Text = tostring(#owned)
             eventCountValue.Text = tostring(eventCount)
             fruitMapValue.Text = tostring(fruitCount)
@@ -2443,17 +2503,7 @@ connect(RunService.Heartbeat, function(dt)
             portalValue.Text = short(portal.lastResult, 42)
             hopValue.Text = short(hop.status, 44)
 
-            local targetRows = {}
-            for i = 1, math.min(#targets, 2) do
-                targetRows[#targetRows + 1] = short(targets[i].Name, 28)
-            end
             targetLabel.Text = short(status, 95)
-
-            local recent = {}
-            for i = math.max(1, #logs - 2), #logs do
-                recent[#recent + 1] = "[" .. logs[i].kind .. "] " .. short(logs[i].text, 27)
-            end
-            logLabel.Text = #recent > 0 and table.concat(recent, "\n") or "-"
         end
     end)
     if not ok then
