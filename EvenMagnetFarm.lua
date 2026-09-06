@@ -31,7 +31,7 @@ local config = {
     Enabled = true, Team = "Marines", AutoSelectTeam = true,
     TeamRetryInterval = 2, TeamRequestTimeout = 5,
     EventScheduleEnabled = true, EventDurationSeconds = 600,
-    Speed = 150, Weapon = "Melee", ScanInterval = 0.5,
+    Speed = 170, Weapon = "Melee", ScanInterval = 0.5,
     AttackInterval = 0.25, AttackRange = 60, HoverHeight = 30,
     AttackNoAnimation = true,
     AutoBuso = true, BusoCheckDelay = 1, BusoRetryDelay = 3,
