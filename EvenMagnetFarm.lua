@@ -1,5 +1,6 @@
--- Event Magnet Farm: standalone client script; HTTP is used only to list
--- public servers for the optional one-time startup hop. No file writes/hooks.
+-- Event Magnet Farm: standalone client script; uses the game's __ServerBrowser
+-- plus HTTP server-list/Worker coordination from the supplied Multi-Account hop.
+-- Worker heartbeat sends username, JobId and PlaceId. No downloaded code/hooks.
 -- Run only one movement/farm script at a time. Stop the other auto scripts first.
 -- Detect replicated events; farm living NPCs whose Name/DisplayName contains
 -- "magnetized" (case insensitive). Generic Magnet tags are diagnostic only.
@@ -14,8 +15,8 @@ local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local Tags = game:GetService("CollectionService")
-local HttpService = game:GetService("HttpService")
 local TeleportService = game:GetService("TeleportService")
+local HttpService = game:GetService("HttpService")
 local VirtualInputManager = game:GetService("VirtualInputManager")
 if not game:IsLoaded() then game.Loaded:Wait() end
 local player = Players.LocalPlayer
@@ -25,15 +26,21 @@ while not player do
 end
 assert(player, "EventMagnetFarm must run on the client")
 local config = {
-    Enabled = true, Speed = 190, Weapon = "Melee", ScanInterval = 0.5,
-    AttackInterval = 0.25, AttackRange = 10, HoverHeight = 6,
+    Enabled = true, Team = "Marines", AutoSelectTeam = true,
+    TeamRetryInterval = 2, TeamRequestTimeout = 5,
+    EventScheduleEnabled = true, EventDurationSeconds = 600,
+    Speed = 190, Weapon = "Melee", ScanInterval = 0.5,
+    AttackInterval = 0.25, AttackRange = 60, HoverHeight = 30,
+    AttackNoAnimation = true,
     TargetTimeout = 120, NoDamageTimeout = 12, NoProgressTimeout = 12,
     RetryDelay = 20, LogLimit = 80,
-    Patrol = true, PatrolHeight = 12, PatrolWait = 15, SpawnTimeout = 30,
+    Patrol = true, PatrolHeight = 12, PatrolWait = 1, SpawnTimeout = 1,
+    WaterWalkEnabled = true, WaterWalkSurfaceY = -4.5,
     PatrolArrival = 6, SpawnRadius = 180,
-    SpawnSettleTime = 5,
-    CampSettleTime = 2,
-    Sea1IslandMode = true, IslandWait = 6, IslandSpawnTimeout = 12,
+    SpawnSettleTime = 1,
+    CampSettleTime = 1,
+    CampMergeRadius = 500, CampNearbyRadius = 220, CampHeightTolerance = 120,
+    Sea1IslandMode = false, IslandWait = 1, IslandSpawnTimeout = 1,
     UsePortalFruit = true, PortalLongDistance = 750, PortalMinSaving = 250,
     PortalTargetRadius = 3000, PortalCooldown = 8, GatewayOpenTimeout = 3,
     GatewayArrivalTimeout = 5, GatewayArrivalRadius = 500,
@@ -43,8 +50,12 @@ local config = {
     FruitPickupAttempts = 3, FruitRetryDelay = 60,
     StoreFruit = true, StoreRetryDelay = 15, StoreAttempts = 3,
     StartupHop = true, StartupDelay = 5, CurrentPlayerLimit = 4,
-    TargetExistingPlayers = 3, HopMaxPages = 3, HopCandidates = 3,
-    HopRequestRetries = 3, HopRetryDelay = 60, HopTeleportTimeout = 8,
+    TargetExistingPlayers = 3, HopMaxPages = 30, HopCandidates = 3,
+    HopRequestRetries = 3, HopRetryDelay = 60, HopTeleportTimeout = 10,
+    HopBrowserTimeout = 8,
+    HopMaxPlayers = 11, HopEmptyPageLimit = 4, HopPageDelay = 0.1,
+    HopMaxAttempts = 8, HopAttemptDelay = 1.5, HopRandomizeTies = true,
+    HopApiUrl = "https://hop.giacode.workers.dev", HopHeartbeatInterval = 30,
 }
 local overrides = env.EventMagnetConfig
 -- Seed coordinates copied from auto_farm_level.lua QuestDatabase (not executed).
@@ -203,7 +214,7 @@ local portalRouteAliases = {
         ["Lab"] = {"Hot and Cold", "Lab"}, ["Lava"] = {"Hot and Cold", "Lava"},
         ["Raid"] = {"Hot and Cold", "Raid"},
         ["Haunted Ship"] = {"Cursed Ship", "Haunted Ship"},
-        ["Snow"] = {"Ice Castle", "Snow"},
+        ["Snow"] = {"Snow Mountain", "Snow"},
         ["Winter Castle"] = {"Ice Castle", "Winter Castle"},
         ["Skull"] = {"Forgotten Island", "Skull"},
     },
@@ -278,8 +289,9 @@ config.LogLimit = math.clamp(math.floor(config.LogLimit), 10, 300)
 config.ScanInterval = math.max(config.ScanInterval, 0.2)
 config.AttackInterval = math.max(config.AttackInterval, 0.1)
 config.Speed = math.clamp(config.Speed, 1, 500)
-config.AttackRange = math.clamp(config.AttackRange, 7, 30)
-config.HoverHeight = math.clamp(config.HoverHeight, 1, config.AttackRange - 2)
+config.HoverHeight = math.clamp(config.HoverHeight, 1, 60)
+config.AttackRange = math.clamp(math.max(config.AttackRange,
+    math.sqrt(config.HoverHeight * config.HoverHeight + 4) + 5), 7, 100)
 config.PatrolWait = math.max(config.PatrolWait, config.ScanInterval * 2)
 config.SpawnTimeout = math.max(config.SpawnTimeout, config.PatrolWait)
 config.IslandWait = math.max(config.IslandWait, config.ScanInterval * 2)
@@ -290,9 +302,18 @@ config.StoreAttempts = math.clamp(math.floor(config.StoreAttempts), 1, 10)
 config.CurrentPlayerLimit = math.max(1, math.floor(config.CurrentPlayerLimit))
 config.TargetExistingPlayers = math.clamp(math.floor(config.TargetExistingPlayers),
     0, math.max(0, config.CurrentPlayerLimit - 1))
-config.HopMaxPages = math.clamp(math.floor(config.HopMaxPages), 1, 10)
+config.HopMaxPages = math.clamp(math.floor(config.HopMaxPages), 1, 30)
+config.HopMaxPlayers = math.clamp(math.floor(config.HopMaxPlayers), 1, 11)
+config.HopMaxAttempts = math.clamp(math.floor(config.HopMaxAttempts), 1, 8)
+config.HopEmptyPageLimit = math.max(1, math.floor(config.HopEmptyPageLimit))
+config.HopHeartbeatInterval = math.max(30, config.HopHeartbeatInterval)
 config.HopCandidates = math.clamp(math.floor(config.HopCandidates), 1, 10)
 config.HopRequestRetries = math.clamp(math.floor(config.HopRequestRetries), 1, 5)
+config.EventDurationSeconds = math.clamp(config.EventDurationSeconds, 1, 3600)
+do
+    local wanted = string.lower(tostring(config.Team or "Marines"))
+    config.Team = (wanted == "pirate" or wanted == "pirates") and "Pirates" or "Marines"
+end
 
 local alive, enabled = true, config.Enabled
 local connections, remotes, mobs = {}, {}, {}
@@ -312,10 +333,32 @@ local patrol = { points = {}, pass = 1, current = nil, refresh = 0,
     arrived = nil, started = nil, best = math.huge, progress = 0 }
 local action = { kind = nil, token = 0 }
 local portal = { retryAt = 0, lastResult = "Chua dung", destination = nil, forCombat = false }
+local closePortalMenu
 local fruitRecords = setmetatable({}, { __mode = "k" })
 local storeRecords = setmetatable({}, { __mode = "k" })
 local fruitTask = { target = nil, started = nil, best = math.huge, progress = 0 }
 local hop = { busy = false, retryAt = 0, status = "Cho kiem tra dau phien" }
+local eventWindow = { active = false, cycle = nil, remaining = 0 }
+local function readEventWindow(timestamp)
+    local elapsed = timestamp % 3600
+    local active = config.EventScheduleEnabled and elapsed < config.EventDurationSeconds
+    return active, active and (config.EventDurationSeconds - elapsed) or (3600 - elapsed),
+        math.floor(timestamp / 3600)
+end
+local function updateEventWindow()
+    local ok, timestamp = pcall(function() return workspace:GetServerTimeNow() end)
+    if not ok then timestamp = os.time() end
+    local active, remaining, cycle = readEventWindow(timestamp)
+    if active and eventWindow.cycle ~= cycle and eventWindow.cycle ~= nil then
+        patrol.pass = patrol.pass + 1
+        patrol.current, patrol.arrived, patrol.started, patrol.seenAt = nil, nil, nil, nil
+        patrol.best = math.huge
+        for _, point in ipairs(patrol.points) do point.retryAt = 0 end
+    end
+    eventWindow.active, eventWindow.remaining, eventWindow.cycle = active, remaining, cycle
+end
+local teamSelect = { desired = config.Team, ready = false, pending = false,
+    pendingSince = 0, nextAttempt = 0, request = 0, lastResult = "Chua chon team" }
 local sessionSerial = (tonumber(env.__EventMagnetSessionSerial) or 0) + 1
 env.__EventMagnetSessionSerial = sessionSerial
 local serverChoiceMemory = env.__EventMagnetServerChoice
@@ -344,6 +387,66 @@ local function connect(signal, callback)
     end)
     table.insert(connections, connection)
     return connection
+end
+local function currentTeamName()
+    local current = player.Team
+    local name = current and current.Name
+    return (name == "Pirates" or name == "Marines") and name or nil
+end
+local function teamSelectionStep(now)
+    local selected = currentTeamName()
+    if selected then
+        if not teamSelect.ready or teamSelect.lastResult ~= "Da vao " .. selected then
+            teamSelect.lastResult = "Da vao " .. selected
+            log("TEAM", teamSelect.lastResult)
+        end
+        teamSelect.ready, teamSelect.pending = true, false
+        return true
+    end
+
+    teamSelect.ready = false
+    if not config.AutoSelectTeam then
+        teamSelect.lastResult = "Auto team tat; hay chon team thu cong"
+        return false
+    end
+
+    if teamSelect.pending and now - teamSelect.pendingSince >= config.TeamRequestTimeout then
+        teamSelect.request = teamSelect.request + 1 -- invalidate a stuck InvokeServer callback
+        teamSelect.pending = false
+        teamSelect.nextAttempt = now + config.TeamRetryInterval
+        teamSelect.lastResult = "SetTeam timeout; se thu lai"
+        log("TEAM", teamSelect.lastResult)
+    end
+    if teamSelect.pending or now < teamSelect.nextAttempt then return false end
+
+    local remotesFolder = RS:FindFirstChild("Remotes")
+    local remote = remotesFolder and remotesFolder:FindFirstChild("CommF_")
+    if not remote or not remote:IsA("RemoteFunction") then
+        teamSelect.nextAttempt = now + config.TeamRetryInterval
+        teamSelect.lastResult = "Chua tim thay Remotes.CommF_"
+        return false
+    end
+
+    teamSelect.request = teamSelect.request + 1
+    local requestId = teamSelect.request
+    teamSelect.pending, teamSelect.pendingSince = true, now
+    teamSelect.nextAttempt = now + config.TeamRetryInterval
+    teamSelect.lastResult = "Dang chon " .. teamSelect.desired
+    task.spawn(function()
+        local ok, response = pcall(function()
+            return remote:InvokeServer("SetTeam", teamSelect.desired)
+        end)
+        if not alive or requestId ~= teamSelect.request then return end
+        teamSelect.pending = false
+        teamSelect.nextAttempt = os.clock() + config.TeamRetryInterval
+        if ok then
+            teamSelect.lastResult = "Da gui SetTeam " .. teamSelect.desired
+        else
+            teamSelect.lastResult = "SetTeam loi: " .. short(response, 80)
+        end
+        log("TEAM", teamSelect.lastResult)
+    end)
+    return false
 end
 local function rootOf(model)
     local root = model and (model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart)
@@ -387,13 +490,19 @@ local function endAction(kind, token)
 end
 local function cancelAction(reason)
     local oldKind = action.kind
+    if oldKind == "portal" and closePortalMenu then pcall(closePortalMenu) end
     if oldKind and reason then log("ACTION", oldKind .. ": " .. reason) end
     action.token = action.token + 1
     action.kind = nil
     portal.destination, portal.forCombat = nil, false
     if oldKind == "hop" then
         hop.busy = false
-        hop.status = "Hop tam dung de uu tien Magnetized"
+        if hop.dispatched then
+            hop.blocked, hop.dispatched = true, false
+            hop.status = "Da gui teleport; dung hop phien nay vi ket qua chua ro"
+        else
+            hop.status = "Hop tam dung de uu tien farm"
+        end
     end
     releaseMovement()
 end
@@ -811,8 +920,9 @@ local function flyTo(root, humanoid, destination, dt, facing)
     if delta.Magnitude > 0.01 then
         position = position + delta.Unit * math.min(config.Speed * math.clamp(dt, 0, 0.1), delta.Magnitude)
     end
-    if facing and (facing - position).Magnitude > 0.01 then
-        root.CFrame = CFrame.lookAt(position, facing)
+    local flatFacing = facing and Vector3.new(facing.X, position.Y, facing.Z)
+    if flatFacing and (flatFacing - position).Magnitude > 0.01 then
+        root.CFrame = CFrame.lookAt(position, flatFacing)
     else
         root.CFrame = CFrame.new(position) * root.CFrame.Rotation
     end
@@ -824,6 +934,15 @@ local sea = ({
 })[game.PlaceId]
 hop.readyAt = nil
 hop.checked = serverChoiceMemory[game.JobId] == true
+do
+    local ok, chosen = pcall(function() return TeleportService:GetTeleportSetting("EventMagnetChosenServer") end)
+    if ok and type(chosen) == "table" and chosen.id == game.JobId
+        and type(chosen.expires) == "number" and chosen.expires > os.time() then
+        hop.checked = true
+        serverChoiceMemory[game.JobId] = true
+        hop.status = "Da vao server duoc bo hop lua chon"
+    end
+end
 
 local function portalTool()
     local character, backpack = player.Character, player:FindFirstChildOfClass("Backpack")
@@ -839,6 +958,11 @@ local function portalSkillReady(tool)
     local mastery = level and tonumber(level.Value)
     if mastery and mastery < 200 then return false, "Portal C chua du mastery" end
     return true, mastery and ("Mastery " .. math.floor(mastery)) or "Portal san sang"
+end
+local function openGateway()
+    local pg = player:FindFirstChildOfClass("PlayerGui")
+    local gateway = pg and pg:FindFirstChild("Gateway", true)
+    if gateway and gateway:IsA("GuiObject") and gateway.Visible then return gateway end
 end
 local function normalizePortalText(value)
     return string.lower(tostring(value or "")):gsub("[^%w]", "")
@@ -891,7 +1015,8 @@ local function findGatewayButton(scrolling, destinationName)
         end
         return labels
     end
-    local aliases = portalAliases(destinationName)
+    local aliases = { destinationName }
+    for _, alias in ipairs(portalAliases(destinationName)) do table.insert(aliases, alias) end
     for _, alias in ipairs(aliases) do
         local wanted = normalizePortalText(alias)
         for _, button in ipairs(buttons) do
@@ -914,17 +1039,14 @@ local function findGatewayButton(scrolling, destinationName)
         end
     end
 end
-local function activateExactButton(button)
-    if type(firesignal) == "function" then
-        local ok = pcall(function() firesignal(button.MouseButton1Click) end)
-        if ok then return true end
-    end
+local function activateExactButton(button, legacy)
+    local signal = legacy and button.MouseButton1Click or button.Activated
     local getConnections = rawget(env, "getconnections")
     if type(getConnections) ~= "function" and type(getconnections) == "function" then
         getConnections = getconnections
     end
     if type(getConnections) == "function" then
-        local ok, list = pcall(getConnections, button.MouseButton1Click)
+        local ok, list = pcall(getConnections, signal)
         if ok and type(list) == "table" then
             local fired = false
             for _, connection in pairs(list) do
@@ -935,23 +1057,47 @@ local function activateExactButton(button)
             if fired then return true end
         end
     end
-    return pcall(function() button:Activate() end)
+    if type(firesignal) == "function" then
+        return pcall(function() firesignal(signal) end)
+    end
+    return false
+end
+closePortalMenu = function()
+    local gateway = openGateway()
+    if not gateway then return end
+    for _, item in ipairs(gateway:GetDescendants()) do
+        if item:IsA("GuiButton") and (string.lower(item.Name):find("close", 1, true)
+            or (item:IsA("TextButton") and item.Text == "X")) then
+            activateExactButton(item, true)
+            break
+        end
+    end
+    -- Local UI cleanup only; this is not a claim that a server warp was cancelled.
+    if gateway.Parent then gateway.Visible = false end
 end
 local function tryStartPortal(targetPosition, root, humanoid, forCombat)
     local distance = (targetPosition - root.Position).Magnitude
+    if action.kind then return false end
     if not config.UsePortalFruit or not (sea == 2 or sea == 3)
         or distance < config.PortalLongDistance or os.clock() < portal.retryAt
-        or action.kind then return false end
+        then
+        if openGateway() then pcall(closePortalMenu) end
+        return false
+    end
     local name = bestPortalFor(targetPosition, root.Position)
-    if not name then return false end
+    if not name then
+        if openGateway() then pcall(closePortalMenu) end
+        return false
+    end
     local tool = portalTool()
     local usable, reason = portalSkillReady(tool)
-    if not usable then
+    if not usable and not openGateway() then
         portal.retryAt, portal.lastResult = os.clock() + config.PortalCooldown, reason
         return false
     end
     local currentName = nearestPortalAnchor(root.Position)
     if currentName and portalRouteKey(currentName) == portalRouteKey(name) then
+        if openGateway() then pcall(closePortalMenu) end
         portal.lastResult = "Cung vung " .. tostring(portalAliases(name)[1]) .. "; bay 190"
         return false
     end
@@ -967,34 +1113,34 @@ local function tryStartPortal(targetPosition, root, humanoid, forCombat)
         local ok, runtimeError = xpcall(function()
             if not actionIsCurrent("portal", token)
                 or (hasLiveMagnetized() and not forCombat) then return end
-            if tool.Parent ~= player.Character then humanoid:EquipTool(tool); task.wait(0.15) end
+            local gateway = openGateway()
+            if not gateway and tool and tool.Parent ~= player.Character then humanoid:EquipTool(tool); task.wait(0.15) end
             if not actionIsCurrent("portal", token)
                 or (hasLiveMagnetized() and not forCombat) then return end
-            pcall(function()
+            if not gateway then pcall(function()
                 VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.C, false, game)
                 task.wait(0.05)
                 VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.C, false, game)
-            end)
+            end) end
             local deadline = os.clock() + config.GatewayOpenTimeout
-            local gateway
             while actionIsCurrent("portal", token) and os.clock() < deadline do
-                local playerGui = player:FindFirstChildOfClass("PlayerGui")
-                local main = playerGui and playerGui:FindFirstChild("Main")
-                gateway = main and main:FindFirstChild("Gateway")
+                gateway = openGateway()
                 if gateway and gateway.Visible then break end
                 task.wait(0.1)
             end
             if not actionIsCurrent("portal", token)
                 or (hasLiveMagnetized() and not forCombat) then return end
             if not gateway or not gateway.Visible then return end
-            local content = gateway:FindFirstChild("MainContent")
-            local scrolling = content and content:FindFirstChild("ScrollingFrame")
-            local button, matched = scrolling and findGatewayButton(scrolling, name)
+            local button, matched = findGatewayButton(gateway, name)
             local routeLabel = matched or portalAliases(name)[1] or name
             if not button then detail = "Khong co nut " .. tostring(routeLabel); return end
-            if not activateExactButton(button) then detail = "Khong bam duoc nut " .. tostring(routeLabel); return end
+            local activated = activateExactButton(button)
+            local fallbackUsed = not activated
+            if fallbackUsed then activated = activateExactButton(button, true) end
+            if not activated then detail = "Khong bam duoc nut " .. tostring(routeLabel); return end
             detail = "Da bam " .. tostring(routeLabel) .. "; cho xac nhan"
             local arrivalDeadline = os.clock() + config.GatewayArrivalTimeout
+            local clickFallbackAt = os.clock() + 1
             while actionIsCurrent("portal", token) and os.clock() < arrivalDeadline do
                 local character = player.Character
                 local newRoot = rootOf(character)
@@ -1008,6 +1154,11 @@ local function tryStartPortal(targetPosition, root, humanoid, forCombat)
                         break
                     end
                 end
+                if not fallbackUsed and os.clock() >= clickFallbackAt and openGateway()
+                    and newRoot and (newRoot.Position - oldPosition).Magnitude < config.GatewayMoveThreshold then
+                    fallbackUsed = true
+                    activateExactButton(button, true)
+                end
                 task.wait(0.2)
             end
             if not success then
@@ -1016,6 +1167,7 @@ local function tryStartPortal(targetPosition, root, humanoid, forCombat)
         end, function(err) return tostring(err) end)
         pcall(function() VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.C, false, game) end)
         if actionIsCurrent("portal", token) then
+            pcall(closePortalMenu)
             portal.lastResult = ok and detail or short(runtimeError, 100)
             log("PORTAL", portal.lastResult)
             portal.destination, portal.forCombat = nil, false
@@ -1026,136 +1178,219 @@ local function tryStartPortal(targetPosition, root, humanoid, forCombat)
     return true
 end
 
-local function requestFunction()
-    if type(request) == "function" then return request end
-    if type(http_request) == "function" then return http_request end
-    if syn and type(syn.request) == "function" then return syn.request end
-    if fluxus and type(fluxus.request) == "function" then return fluxus.request end
-end
-local function httpGet(url)
-    local requestFn = requestFunction()
-    if not requestFn then return game:HttpGet(url) end
-    local response = requestFn({ Url = url, Method = "GET", Headers = { Accept = "application/json" } })
-    if type(response) == "string" then return response end
-    if type(response) == "table" then
-        local statusCode = tonumber(response.StatusCode or response.Status or 200) or 0
-        if statusCode >= 200 and statusCode < 300 and type(response.Body) == "string" then
-            return response.Body
-        end
-        error("HTTP " .. tostring(statusCode))
-    end
-    error("HTTP response khong hop le")
+-- Adapted from the user's Standalone Low Player Server Hop (Multi-Account).
+-- All waits belong to this farm session; no second movement/controller loop.
+local hopRandom = Random.new()
+local hopVisited = {}
+do
+    local ok, saved = pcall(function() return TeleportService:GetTeleportSetting("EventMagnetHopTTL") end)
+    if ok and type(saved) == "table" then hopVisited = saved end
 end
 local function loadVisitedServers()
-    local ordered, seen = {}, {}
-    local ok, saved = pcall(function()
-        return TeleportService:GetTeleportSetting("EventMagnetVisitedV2")
-    end)
-    if ok and type(saved) == "table" then
-        for _, id in ipairs(saved) do
-            if type(id) == "string" and not seen[id] then
-                seen[id] = true; table.insert(ordered, id)
-            end
-        end
+    local seen = { [game.JobId] = true }
+    for id, expires in pairs(hopVisited) do
+        if type(expires) == "number" and expires > os.time() then seen[id] = true
+        else hopVisited[id] = nil end
     end
-    if game.JobId ~= "" and not seen[game.JobId] then
-        seen[game.JobId] = true; table.insert(ordered, game.JobId)
-    end
-    return ordered, seen
+    return seen
 end
-local function saveVisitedServer(ordered, seen, id)
-    if type(id) == "string" and not seen[id] then
-        seen[id] = true; table.insert(ordered, id)
-    end
-    while #ordered > 30 do
-        local removed = table.remove(ordered, 1)
-        seen[removed] = nil
-    end
-    pcall(function() TeleportService:SetTeleportSetting("EventMagnetVisitedV2", ordered) end)
+local function saveVisitedServer(id)
+    hopVisited[id] = os.time() + 90
+    pcall(function() TeleportService:SetTeleportSetting("EventMagnetHopTTL", hopVisited) end)
 end
-local function findHopCandidates(token)
-    local ordered, seen = loadVisitedServers()
-    local candidates, cursor, lastError = {}, nil, "Khong co server phu hop"
-    for _ = 1, config.HopMaxPages do
-        if not actionIsCurrent("hop", token) or hasLiveMagnetized() then return nil, ordered, seen, "Da huy" end
-        local url = string.format("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&excludeFullGames=true&limit=100", game.PlaceId)
-        if cursor and cursor ~= "" then url = url .. "&cursor=" .. HttpService:UrlEncode(cursor) end
-        local response
-        for attempt = 1, config.HopRequestRetries do
-            local ok, value = pcall(function() return HttpService:JSONDecode(httpGet(url)) end)
-            if ok and type(value) == "table" and type(value.data) == "table" then response = value; break end
-            lastError = tostring(value)
-            if attempt < config.HopRequestRetries then task.wait(attempt) end
-        end
-        if not response then break end
-        for _, server in ipairs(response.data) do
-            local id, playing, maximum = server.id, tonumber(server.playing), tonumber(server.maxPlayers)
-            if type(id) == "string" and playing and maximum and playing < maximum
-                and playing <= config.TargetExistingPlayers and not seen[id] then
-                table.insert(candidates, { id = id, playing = playing,
-                    ping = tonumber(server.ping) or math.huge, fps = tonumber(server.fps) or 0 })
-            end
-        end
-        cursor = response.nextPageCursor
-        if #candidates >= config.HopCandidates or not cursor or cursor == "" then break end
-    end
-    table.sort(candidates, function(a, b)
-        if a.playing ~= b.playing then return a.playing < b.playing end
-        if a.ping ~= b.ping then return a.ping < b.ping end
-        return a.fps > b.fps
+local function hopAllowed(token)
+    return actionIsCurrent("hop", token) and not eventWindow.active
+        and not hasLiveMagnetized() and #ownedFruitTools() == 0
+end
+local function hopRequest(options)
+    local requestFn = (type(http_request) == "function" and http_request)
+        or (type(request) == "function" and request)
+        or (type(syn) == "table" and syn.request)
+        or (type(http) == "table" and http.request)
+        or (type(fluxus) == "table" and fluxus.request)
+    if type(requestFn) ~= "function" then return nil end
+    options.url, options.method = options.Url, options.Method or "GET"
+    options.headers, options.body = options.Headers, options.Body
+    return requestFn(options)
+end
+local function hopCall(token, callback)
+    local done, ok, value = false, false, nil
+    task.spawn(function()
+        if hopAllowed(token) then ok, value = pcall(callback) end
+        done = true
     end)
-    if #candidates == 0 then return nil, ordered, seen, lastError end
-    return candidates, ordered, seen
+    local deadline = os.clock() + config.HopBrowserTimeout
+    while not done and hopAllowed(token) and os.clock() < deadline do task.wait(0.1) end
+    if not done then
+        -- A yielded request cannot be revoked; don't accumulate more requests.
+        hop.blocked = true
+        return false, "Request timeout/da huy; dung hop phien nay"
+    end
+    return ok, value
+end
+local function workerRequest(path, payload)
+    if config.HopApiUrl == "" then return nil end
+    return hopRequest({
+        Url = config.HopApiUrl:gsub("/+$", "") .. path,
+        Method = payload and "POST" or "GET",
+        Headers = { ["Content-Type"] = "application/json" },
+        Body = payload and HttpService:JSONEncode(payload) or nil,
+    })
+end
+local function fetchOccupiedServers(token)
+    local occupied = loadVisitedServers()
+    if config.HopApiUrl == "" then return occupied end
+    local ok, response = hopCall(token, function() return workerRequest("/api/occupied") end)
+    if ok and type(response) == "table" and tonumber(response.StatusCode) == 200 then
+        local decoded, data = pcall(function() return HttpService:JSONDecode(response.Body) end)
+        if decoded and type(data) == "table" and type(data.occupied) == "table" then
+            for _, id in ipairs(data.occupied) do occupied[tostring(id)] = true end
+        end
+    end
+    return occupied
+end
+local function chooseHopCandidate(candidates)
+    if #candidates == 0 then return nil end
+    local best, ties = math.huge, {}
+    for _, candidate in ipairs(candidates) do
+        if candidate.playing < best then best, ties = candidate.playing, { candidate }
+        elseif candidate.playing == best then table.insert(ties, candidate) end
+    end
+    return ties[config.HopRandomizeTies and hopRandom:NextInteger(1, #ties) or 1]
+end
+local function findHopCandidates(token, occupied)
+    local browser = RS:FindFirstChild("__ServerBrowser")
+    if browser and not browser:IsA("RemoteFunction") then browser = nil end
+    local candidates, added, empty = {}, {}, 0
+    local function add(id, count, maximum)
+        if type(id) == "string" and id ~= "" and count and count >= 0
+            and count <= config.HopMaxPlayers and count < maximum
+            and not occupied[id] and not added[id] then
+            added[id] = true
+            table.insert(candidates, { id = id, playing = count, browser = browser })
+        end
+    end
+    if browser then
+        for page = 1, config.HopMaxPages do
+            if not hopAllowed(token) or hop.blocked then return nil end
+            hop.status = "Quet ServerBrowser trang " .. page
+            local ok, servers = hopCall(token, function() return browser:InvokeServer(page) end)
+            if hop.blocked then return nil end
+            if not ok or type(servers) ~= "table" or next(servers) == nil then empty = empty + 1
+            else
+                empty = 0
+                for id, info in pairs(servers) do
+                    if type(info) == "table" then add(id, tonumber(info.Count), 12) end
+                end
+            end
+            local best = chooseHopCandidate(candidates)
+            if (best and best.playing <= config.TargetExistingPlayers) or empty >= config.HopEmptyPageLimit then break end
+            task.wait(config.HopPageDelay)
+        end
+    end
+    local best = chooseHopCandidate(candidates)
+    if best then return best end
+    -- User script's Roblox public-server API fallback, always the current PlaceId.
+    local cursor = ""
+    for page = 1, 4 do
+        if not hopAllowed(token) or hop.blocked then return nil end
+        hop.status = "Quet Roblox API trang " .. page
+        local url = string.format("https://games.roblox.com/v1/games/%s/servers/Public?sortOrder=Asc&limit=100", tostring(game.PlaceId))
+        if cursor ~= "" then url = url .. "&cursor=" .. HttpService:UrlEncode(cursor) end
+        local ok, response = hopCall(token, function() return hopRequest({ Url = url, Method = "GET" }) end)
+        if not ok or type(response) ~= "table" or tonumber(response.StatusCode) ~= 200 then break end
+        local decoded, data = pcall(function() return HttpService:JSONDecode(response.Body) end)
+        if not decoded or type(data) ~= "table" or type(data.data) ~= "table" then break end
+        for _, info in ipairs(data.data) do
+            if type(info) == "table" then add(info.id, tonumber(info.playing), tonumber(info.maxPlayers) or 12) end
+        end
+        best = chooseHopCandidate(candidates)
+        if best and best.playing <= config.TargetExistingPlayers then break end
+        cursor = type(data.nextPageCursor) == "string" and data.nextPageCursor or ""
+        if cursor == "" then break end
+        task.wait(0.2)
+    end
+    return chooseHopCandidate(candidates)
+end
+local function requestHopTeleport(token, candidate)
+    if config.HopApiUrl ~= "" then
+        hopCall(token, function() return workerRequest("/api/reserve", { jobId = candidate.id }) end)
+    end
+    if not hopAllowed(token) or hop.blocked then return "cancelled" end
+    saveVisitedServer(candidate.id)
+    -- Accept our chosen fallback server after re-execute, avoiding a hop chain.
+    pcall(function()
+        TeleportService:SetTeleportSetting("EventMagnetChosenServer", {
+            id = candidate.id, expires = os.time() + 120,
+        })
+    end)
+    hop.status = "Dang vao server " .. candidate.playing .. " nguoi"
+    local failed, started, done, failureMessage = false, false, false, nil
+    local failedConnection = TeleportService.TeleportInitFailed:Connect(function(who, result, message)
+        if who == player then failed, failureMessage = true, tostring(result) .. ": " .. tostring(message) end
+    end)
+    local stateConnection = player.OnTeleport:Connect(function(state)
+        if state == Enum.TeleportState.Started or state == Enum.TeleportState.InProgress then started = true end
+        if state == Enum.TeleportState.Failed then failed, failureMessage = true, failureMessage or "Teleport failed" end
+    end)
+    hop.dispatched = true
+    task.spawn(function()
+        if not hopAllowed(token) then done, failed = true, true; return end
+        local ok, err = false, nil
+        if candidate.browser then
+            ok, err = pcall(function() candidate.browser:InvokeServer("teleport", candidate.id) end)
+        end
+        -- Match supplied fallback only on a thrown call error or missing browser;
+        -- never send a second route after Started or an explicit restriction.
+        if not ok and not started and not failed and hopAllowed(token) then
+            ok, err = pcall(function() TeleportService:TeleportToPlaceInstance(game.PlaceId, candidate.id, player) end)
+        end
+        if not ok then failed, failureMessage = true, tostring(err) end
+        done = true
+    end)
+    local deadline = os.clock() + config.HopTeleportTimeout
+    while actionIsCurrent("hop", token) and not failed and os.clock() < deadline do task.wait(0.2) end
+    if failed and actionIsCurrent("hop", token) then task.wait(0.3) end
+    failedConnection:Disconnect(); stateConnection:Disconnect()
+    hop.dispatched = false
+    if not actionIsCurrent("hop", token) then return "cancelled" end
+    if started and not failed or not done then
+        hop.blocked = true
+        hop.status = "Teleport chua ro ket qua; dung hop phien nay"
+        return "pending"
+    end
+    -- A completed request with no departure can retry as in the supplied script.
+    hop.status = failureMessage or "Van o server cu sau timeout; thu server khac"
+    log("HOP", hop.status)
+    return "retry"
 end
 local function startHop()
-    if hop.busy or hop.checked or action.kind then return false end
+    if hop.busy or hop.checked or hop.blocked or action.kind or eventWindow.active then return false end
     local token = beginAction("hop")
     if not token then return false end
-    hop.busy, hop.status = true, "Dang tim server <= " .. config.TargetExistingPlayers .. " nguoi"
+    hop.busy, hop.status = true, "Dang tim server it nguoi"
     releaseMovement()
     task.spawn(function()
-        local candidates, ordered, seen, findError = findHopCandidates(token)
-        if not actionIsCurrent("hop", token) then return end
-        if not candidates then
-            hop.busy, hop.retryAt = false, os.clock() + config.HopRetryDelay
-            hop.status = "Khong tim thay server: " .. short(findError, 80)
-            log("HOP", hop.status)
-            endAction("hop", token)
-            return
-        end
-        local attempts = math.min(#candidates, config.HopCandidates)
-        for index = 1, attempts do
-            if not actionIsCurrent("hop", token) or hasLiveMagnetized()
-                or #ownedFruitTools() > 0 then break end
-            local candidate = candidates[index]
-            saveVisitedServer(ordered, seen, candidate.id)
-            hop.status = "Thu server " .. candidate.playing .. " nguoi"
-            local failed, started, failureMessage = false, false, nil
-            local failedConnection = TeleportService.TeleportInitFailed:Connect(function(who, _, message)
-                if who == player then failed, failureMessage = true, message end
-            end)
-            local teleportConnection = player.OnTeleport:Connect(function(state)
-                if state == Enum.TeleportState.Started or state == Enum.TeleportState.InProgress then started = true end
-            end)
-            local ok, callError = pcall(function()
-                TeleportService:TeleportToPlaceInstance(game.PlaceId, candidate.id, player)
-            end)
-            if not ok then failed, failureMessage = true, callError end
-            local deadline = os.clock() + config.HopTeleportTimeout
-            while actionIsCurrent("hop", token) and not failed and not started
-                and os.clock() < deadline do task.wait(0.2) end
-            failedConnection:Disconnect(); teleportConnection:Disconnect()
-            if started then return end
-            if not actionIsCurrent("hop", token) then return end
-            if not failed then
-                failureMessage = "Teleport timeout"
-                break
+        local ok, err = pcall(function()
+            for attempt = 1, config.HopMaxAttempts do
+                if not hopAllowed(token) or hop.blocked then break end
+                hop.status = "Quet server lan " .. attempt .. "/" .. config.HopMaxAttempts
+                local occupied = fetchOccupiedServers(token)
+                if not hopAllowed(token) or hop.blocked then break end
+                local candidate = findHopCandidates(token, occupied)
+                if candidate and hopAllowed(token) and not hop.blocked then
+                    local outcome = requestHopTeleport(token, candidate)
+                    if outcome ~= "retry" then break end
+                end
+                local deadline = os.clock() + config.HopAttemptDelay
+                while hopAllowed(token) and os.clock() < deadline do task.wait(0.1) end
             end
-            log("HOP", "That bai: " .. short(failureMessage, 100))
-        end
+        end)
         if actionIsCurrent("hop", token) then
             hop.busy, hop.retryAt = false, os.clock() + config.HopRetryDelay
-            hop.status = "Cho thu hop lai"
+            if not ok then hop.status = "Hop loi: " .. short(err, 100)
+            elseif not hop.blocked then hop.status = "Het luot quet; cho thu lai" end
+            log("HOP", hop.status)
             endAction("hop", token)
         end
     end)
@@ -1196,20 +1431,51 @@ local function islandAt(position)
     return name
 end
 local function addPatrolPoint(name, position, source)
+    -- Boss respawn timers are not farm camps. Filter before stripping [Boss]
+    -- or merging nearby markers, so they never add a stop to the patrol route.
+    local spawnName = string.lower(tostring(name or ""))
+    local bareName = spawnName:gsub("%b[]", ""):gsub("%s+", " "):match("^%s*(.-)%s*$")
+    if spawnName:find("%f[%a]boss%f[%A]") or bareName == "don swan" then
+        return false
+    end
     if typeof(position) ~= "Vector3" then return false end
     for _, coordinate in ipairs({position.X, position.Y, position.Z}) do
         if coordinate ~= coordinate or math.abs(coordinate) == math.huge then return false end
     end
+    -- Strip level/event suffixes so every Mercenary spawn belongs to its camp.
+    local mobKey = string.lower(tostring(name)):gsub("%b[]", "")
+        :gsub("magnetized", ""):gsub("%s+", " "):match("^%s*(.-)%s*$")
     if islandMode then
         name = sea1Islands[name] or islandAt(position) or ("Khu spawn " .. short(name, 30)
             .. " @" .. math.floor(position.X) .. "," .. math.floor(position.Z))
     end
+    local nearest, nearestDistance
     for _, point in ipairs(patrol.points) do
         if islandMode and point.name == name then return false end
-        if (point.position - position).Magnitude < 35 then return false end
+        local distance = (point.position - position).Magnitude
+        if islandMode and distance < 35 then return false end
+        if not islandMode then
+            local radius = point.mobKeys[mobKey] and config.CampMergeRadius or config.CampNearbyRadius
+            if distance <= radius and math.abs(point.position.Y - position.Y) <= config.CampHeightTolerance
+                and (not nearestDistance or distance < nearestDistance) then
+                nearest, nearestDistance = point, distance
+            end
+        end
+    end
+    local memberKey = string.format("%.0f:%.0f:%.0f", position.X, position.Y, position.Z)
+    if nearest then
+        if not nearest.members[memberKey] then
+            nearest.members[memberKey] = true
+            nearest.spawnCount = nearest.spawnCount + 1
+            nearest.radius = math.max(nearest.radius, nearestDistance + config.SpawnRadius)
+        end
+        nearest.mobKeys[mobKey] = true
+        -- Keep the visit anchor and visited flag stable during marker refresh.
+        return false
     end
     table.insert(patrol.points, { name = short(name, 80), position = position,
-        source = source, visited = 0, retryAt = 0 })
+        source = source, visited = 0, retryAt = 0, radius = config.SpawnRadius,
+        mobKeys = { [mobKey] = true }, members = { [memberKey] = true }, spawnCount = 1 })
     return true
 end
 function api.AddPatrolPoint(name, position)
@@ -1221,6 +1487,7 @@ function api.GetPatrol()
     for _, point in ipairs(patrol.points) do
         if point.visited == patrol.pass then visited = visited + 1 end
         table.insert(points, { name = point.name, position = point.position,
+            spawnCount = point.spawnCount, radius = point.radius,
             source = point.source, visited = point.visited == patrol.pass, retryAt = point.retryAt })
     end
     return { pass = patrol.pass, visited = visited, total = #points, points = points,
@@ -1231,6 +1498,8 @@ function api.GetState()
     local owned, blocked, waiting = getStoreSummary()
     return {
         alive = alive, enabled = enabled, sea = sea, action = action.kind,
+        eventActive = eventWindow.active, eventRemaining = eventWindow.remaining,
+        hopBlocked = hop.blocked == true,
         status = status, magnetized = #targets, worldFruits = #api.GetFruits(),
         ownedFruits = #owned, blockedFruits = blocked, waitingStore = waiting,
         portal = portal.lastResult, portalDestination = portal.destination,
@@ -1244,9 +1513,15 @@ local function refreshSpawnPoints()
     local folder = origin and origin:FindFirstChild("EnemySpawns")
     if not folder then return end
     for _, instance in ipairs(folder:GetDescendants()) do
-        if instance:IsA("BasePart") then
+        -- A Model marker contributes its pivot once, not every decorative part.
+        local ancestor, nested = instance.Parent, false
+        while ancestor and ancestor ~= folder do
+            if ancestor:IsA("Model") then nested = true; break end
+            ancestor = ancestor.Parent
+        end
+        if not nested and instance:IsA("BasePart") then
             addPatrolPoint(instance.Name, instance.Position, "EnemySpawns")
-        elseif instance:IsA("Model") and instance:FindFirstChildWhichIsA("BasePart", true) then
+        elseif not nested and instance:IsA("Model") and instance:FindFirstChildWhichIsA("BasePart", true) then
             addPatrolPoint(instance.Name, instance:GetPivot().Position, "EnemySpawns")
         end
     end
@@ -1306,11 +1581,12 @@ local function patrolStep(root, humanoid, dt, now)
         local seenNPC = false
         for model in pairs(mobs) do
             local h, r = livingNPC(model)
-            if h and (r.Position - point.position).Magnitude <= config.SpawnRadius then
+            if h and (r.Position - point.position).Magnitude <= (point.radius or config.SpawnRadius)
+                and math.abs(r.Position.Y - point.position.Y) <= config.CampHeightTolerance then
                 seenNPC = true; break
             end
         end
-        status = "Quan sat " .. point.name .. " | " .. math.floor(elapsed)
+        status = "Quan sat bai " .. point.name .. " (" .. point.spawnCount .. " diem spawn) | " .. math.floor(elapsed)
             .. "s | " .. (seenNPC and "co quai" or "cho spawn")
         if seenNPC then patrol.seenAt = patrol.seenAt or now else patrol.seenAt = nil end
         local settleTime = islandMode and config.SpawnSettleTime or config.CampSettleTime
@@ -1354,19 +1630,60 @@ local function equip(character, humanoid)
         end
     end
 end
-local function attack(mobRoot, tool)
-    -- Same explicit combat remote names/argument shape used by auto_farm_level.lua.
-    -- Server acceptance is not assumed; HP progress is monitored separately.
+-- Resolver adapted from auto_factory.lua ResolveCombatRemotes/TrySourceMeleeAttack.
+-- Module require may yield: resolve in one background task, never the Heartbeat.
+local combatRemote = { register = nil, hit = nil, resolving = false, retryAt = 0,
+    status = "Cho combat remotes" }
+local function resolveCombatRemotes()
+    if combatRemote.register and combatRemote.register.Parent
+        and combatRemote.hit and combatRemote.hit.Parent then return true end
+    if combatRemote.resolving or os.clock() < combatRemote.retryAt then return false end
     local modules = RS:FindFirstChild("Modules")
     local net = modules and modules:FindFirstChild("Net")
     local register = net and net:FindFirstChild("RE/RegisterAttack")
     local hit = net and net:FindFirstChild("RE/RegisterHit")
+    combatRemote.retryAt = os.clock() + 2
     if register and register:IsA("RemoteEvent") and hit and hit:IsA("RemoteEvent") then
-        register:FireServer(0)
-        hit:FireServer(mobRoot, {})
-    else
-        tool:Activate()
+        combatRemote.register, combatRemote.hit = register, hit
+        return true
     end
+    if not register or not net or not net:IsA("ModuleScript") then
+        combatRemote.status = "Thieu Modules.Net/RegisterAttack"
+        return false
+    end
+    combatRemote.resolving, combatRemote.status = true, "Dang lay RegisterHit qua Modules.Net"
+    task.spawn(function()
+        local ok, result = pcall(function()
+            local netApi = require(net)
+            return netApi:RemoteEvent("RegisterHit", true)
+        end)
+        if not alive or sessionSerial ~= env.__EventMagnetSessionSerial then return end
+        combatRemote.resolving = false
+        if ok and typeof(result) == "Instance" and result:IsA("RemoteEvent") then
+            combatRemote.register, combatRemote.hit = register, result
+            combatRemote.status = "Attack No Animation"
+        else
+            combatRemote.status = "Khong lay duoc RegisterHit"
+            log("COMBAT", combatRemote.status .. ": " .. short(result, 80))
+        end
+    end)
+    return false
+end
+local function attack(mobRoot, tool)
+    if not config.AttackNoAnimation then
+        local ok, err = pcall(function() tool:Activate() end)
+        return ok, ok and "Tool attack" or short(err, 80)
+    end
+    if not resolveCombatRemotes() then return false, combatRemote.status end
+    local ok, err = pcall(function()
+        combatRemote.register:FireServer(0)
+        combatRemote.hit:FireServer(mobRoot, {})
+    end)
+    if not ok then
+        combatRemote.register, combatRemote.hit = nil, nil
+        combatRemote.status = "Combat remote loi: " .. short(err, 80)
+    end
+    return ok, ok and "Attack No Animation" or combatRemote.status
 end
 
 local function nearestFruit(root, now)
@@ -1495,9 +1812,45 @@ local function fruitStep(root, humanoid, dt, now)
     return true
 end
 
+local seatRecovery = { root = nil, nextAttempt = 0, pending = false }
+local function recoverFromSeat(root, humanoid, now)
+    if seatRecovery.root ~= root then
+        seatRecovery.root, seatRecovery.nextAttempt, seatRecovery.pending = root, 0, false
+    end
+    if humanoid.Sit or humanoid.SeatPart then
+        releaseMovement()
+        seatRecovery.pending = true
+        status = "Dang tu roi ghe de tiep tuc farm"
+        if now >= seatRecovery.nextAttempt then
+            seatRecovery.nextAttempt = now + 0.5
+            humanoid.PlatformStand = false
+            humanoid.Sit = false
+            humanoid.Jump = true
+            humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+        end
+        return true
+    end
+    if seatRecovery.pending then
+        -- Chỉ nâng nhân vật sau khi SeatPart đã nhả để không kéo theo ghế/thuyền.
+        seatRecovery.pending = false
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.AssemblyAngularVelocity = Vector3.zero
+        root.CFrame = root.CFrame + Vector3.new(0, 12, 0)
+        patrol.started, patrol.arrived, patrol.seenAt = nil, nil, nil
+        patrol.progress, patrol.best = now, math.huge
+        status = "Da roi ghe; tiep tuc farm"
+        log("FARM", status)
+    end
+    return false
+end
 local function farmStep(dt)
     if not enabled then return end
     local now = os.clock()
+    if not teamSelectionStep(now) then
+        releaseMovement()
+        status = teamSelect.lastResult
+        return
+    end
     local character = player.Character
     local humanoid = character and character:FindFirstChildOfClass("Humanoid")
     local root = rootOf(character)
@@ -1505,10 +1858,15 @@ local function farmStep(dt)
         resetTarget(); status = "Cho respawn..."; return
     end
     hop.readyAt = hop.readyAt or (now + config.StartupDelay)
-    if humanoid.Sit or humanoid.SeatPart then
-        resetTarget(); status = "Hay roi ghe/thuyen de farm"; return
+    if recoverFromSeat(root, humanoid, now) then return end
+    if eventWindow.active and action.kind == "hop" and not hop.dispatched then
+        cancelAction("den gio event; uu tien tuan tra")
     end
-    if hasLiveMagnetized() and action.kind
+    if config.EventScheduleEnabled and not eventWindow.active and action.kind == "portal"
+        and not portal.forCombat and not fruitTask.target then
+        cancelAction("het gio event; dung Portal tuan tra")
+    end
+    if hasLiveMagnetized() and action.kind and not hop.dispatched
         and not (action.kind == "portal" and portal.forCombat) then
         cancelAction("nhuong Magnetized")
     end
@@ -1552,7 +1910,7 @@ local function farmStep(dt)
 
             if not config.StartupHop then
                 hop.checked, hop.status = true, "Hop dau phien dang tat"
-            elseif not hop.checked then
+            elseif not hop.checked and not hop.blocked and not eventWindow.active then
                 if now < hop.readyAt then
                     status = "Cho on dinh dau phien " .. math.ceil(hop.readyAt - now) .. "s"
                     return
@@ -1571,7 +1929,13 @@ local function farmStep(dt)
 
             -- Do not collect more Fruit while an owned Fruit cannot be stored;
             -- patrol still continues so Magnetized farming is never blocked.
-            if #owned == 0 and hop.checked and fruitStep(root, humanoid, dt, now) then return end
+            if #owned == 0 and (hop.checked or hop.blocked)
+                and not eventWindow.active and fruitStep(root, humanoid, dt, now) then return end
+            if config.EventScheduleEnabled and not eventWindow.active then
+                releaseMovement()
+                status = "Cho event dau gio | con " .. math.ceil(eventWindow.remaining) .. "s"
+                return
+            end
             patrolStep(root, humanoid, dt, now)
             return
         end
@@ -1613,14 +1977,105 @@ local function farmStep(dt)
     if distance <= config.AttackRange and attackClock >= config.AttackInterval then
         attackClock = 0
         local tool = equip(character, humanoid)
-        if tool then attack(mobRoot, tool) else status = "Khong tim thay vu khi: " .. config.Weapon end
+        if tool then
+            local sent, detail = attack(mobRoot, tool)
+            if not sent then status = detail end
+        else status = "Khong tim thay vu khi: " .. config.Weapon end
     end
 end
 
+-- Mặt đứng trên nước lấy từ cơ chế đã test; luôn hoạt động trong suốt phiên,
+-- kể cả lúc bay, mở Portal hoặc tạm dừng farm. Chỉ Destroy mới dọn platform.
+local waterPlatform
+local staleWaterPlatform = workspace:FindFirstChild("EventMagnetWaterPlatform")
+if staleWaterPlatform and staleWaterPlatform:IsA("BasePart") then
+    pcall(function() staleWaterPlatform:Destroy() end)
+end
+local function updateWaterWalk()
+    if waterPlatform then waterPlatform.CanCollide = false end
+    if not alive or not config.WaterWalkEnabled then return end
+    local character = player.Character
+    local root = rootOf(character)
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    if not root or not humanoid or humanoid.Health <= 0 or humanoid.Sit then return end
+
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = waterPlatform and { character, waterPlatform } or { character }
+    params.IgnoreWater = false
+    local hit = workspace:Raycast(
+        root.Position + Vector3.new(0, 5, 0),
+        Vector3.new(0, -140, 0),
+        params
+    )
+    local surface = config.WaterWalkSurfaceY
+    local hitName = hit and string.lower(hit.Instance.Name) or ""
+    if hit and (hit.Material == Enum.Material.Water or hitName == "sea"
+        or hitName:find("water", 1, true) or hitName:find("ocean", 1, true)) then
+        surface = hit.Position.Y
+    elseif hit and hit.Position.Y > surface - 8 then
+        return
+    end
+    if root.Position.Y > surface + 70 or root.Position.Y < surface - 15 then return end
+
+    if not waterPlatform then
+        waterPlatform = Instance.new("Part")
+        waterPlatform.Name = "EventMagnetWaterPlatform"
+        waterPlatform.Size = Vector3.new(32, 1, 32)
+        waterPlatform.Anchored = true
+        waterPlatform.Transparency = 1
+        waterPlatform.CanTouch = false
+        waterPlatform.CanQuery = false
+        waterPlatform.CastShadow = false
+        waterPlatform.Parent = workspace
+    end
+    waterPlatform.CFrame = CFrame.new(root.Position.X, surface - 0.5, root.Position.Z)
+    waterPlatform.CanCollide = true
+end
+connect(RunService.Stepped, function()
+    local ok, err = pcall(updateWaterWalk)
+    if not ok then
+        if waterPlatform then waterPlatform.CanCollide = false end
+        if os.clock() - lastError > 5 then
+            lastError = os.clock()
+            log("WATER", short(err, 100))
+        end
+    end
+end)
+
 local gui = Instance.new("ScreenGui")
-gui.Name, gui.ResetOnSpawn, gui.DisplayOrder = "EventMagnetFarmUI", false, 100
+gui.Name, gui.ResetOnSpawn, gui.DisplayOrder = "EventMagnetFarmUI", false, 1000
+gui.IgnoreGuiInset = true
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+local function tryMountGui(parent)
+    if not parent then return false end
+    local ok = pcall(function()
+        local stale = parent:FindFirstChild(gui.Name)
+        if stale and stale ~= gui then stale:Destroy() end
+        gui.Parent = parent
+    end)
+    return ok and gui.Parent == parent
+end
+local mounted = false
+if type(gethui) == "function" then
+    local ok, hiddenUi = pcall(gethui)
+    if ok then mounted = tryMountGui(hiddenUi) end
+end
+if not mounted then
+    local ok, coreGui = pcall(function() return game:GetService("CoreGui") end)
+    if ok then mounted = tryMountGui(coreGui) end
+end
+if not mounted then
+    local playerGui = player:FindFirstChildOfClass("PlayerGui")
+        or player:WaitForChild("PlayerGui", 15)
+    mounted = tryMountGui(playerGui)
+end
+if not mounted then
+    gui:Destroy()
+    error("Khong the hien EventMagnetFarmUI qua gethui/CoreGui/PlayerGui")
+end
 local panel = Instance.new("Frame")
-panel.Size, panel.Position = UDim2.fromOffset(400, 360), UDim2.new(0, 12, 0.5, -180)
+panel.Size, panel.Position = UDim2.fromOffset(400, 420), UDim2.new(0, 12, 0.5, -210)
 panel.BackgroundColor3, panel.Parent = Color3.fromRGB(24, 28, 36), gui
 local function label(y, height, size)
     local item = Instance.new("TextLabel")
@@ -1632,10 +2087,10 @@ local function label(y, height, size)
     return item
 end
 label(10, 25, 17).Text = "MAGNETIZED FARM | 190 default"
-local statusLabel, listLabel, eventLabel = label(40, 55, 14), label(100, 100, 13), label(205, 95, 12)
+local statusLabel, listLabel, eventLabel = label(40, 55, 14), label(100, 170, 13), label(275, 90, 12)
 local function button(text, x, width)
     local item = Instance.new("TextButton")
-    item.Text, item.Position, item.Size = text, UDim2.fromOffset(x, 318), UDim2.fromOffset(width, 30)
+    item.Text, item.Position, item.Size = text, UDim2.fromOffset(x, 378), UDim2.fromOffset(width, 30)
     item.BackgroundColor3, item.TextColor3 = Color3.fromRGB(45, 67, 85), Color3.new(1, 1, 1)
     item.TextSize, item.Parent = 14, panel
     return item
@@ -1643,6 +2098,7 @@ end
 local toggle, close = button("DUNG FARM", 10, 230), button("THOAT", 250, 140)
 function api.Destroy()
     if not alive then return end
+    if waterPlatform then waterPlatform:Destroy(); waterPlatform = nil end
     cancelAction("Destroy")
     alive, enabled = false, false
     resetTarget()
@@ -1689,6 +2145,7 @@ connect(RunService.Heartbeat, function(dt)
             fruitESPClock = 0
             updateFruitESP(rootOf(player.Character))
         end
+        updateEventWindow()
         farmStep(dt)
         if uiClock >= 0.3 then
             uiClock = 0
@@ -1701,7 +2158,13 @@ connect(RunService.Heartbeat, function(dt)
             local owned, blocked, waiting = getStoreSummary()
             local fruitCount = 0
             for _ in pairs(fruitRecords) do fruitCount = fruitCount + 1 end
-            local rows = { "Vong " .. patrol.pass .. (islandMode and " | Dao " or " | Bai ") .. visited .. "/" .. #patrol.points,
+            local rows = { "Team: " .. tostring(currentTeamName() or teamSelect.lastResult),
+                config.EventScheduleEnabled and ((eventWindow.active and "EVENT dang mo | con " or "EVENT tiep theo | ")
+                    .. string.format("%02d:%02d", math.floor(eventWindow.remaining / 60), math.floor(eventWindow.remaining % 60)))
+                    or "Lich event: tat",
+                "Vong " .. patrol.pass .. (islandMode and " | Dao " or " | Bai ") .. visited .. "/" .. #patrol.points,
+                (config.AttackNoAnimation and "Attack No Animation" or "Tool attack")
+                    .. " | Cao +" .. config.HoverHeight,
                 "Magnetized: " .. #targets .. " | Event: " .. eventCount .. " | Nhan: " .. deliveryCount,
                 "Fruit map: " .. fruitCount .. " | Giu: " .. #owned
                     .. " | Cho/chan: " .. waiting .. "/" .. blocked,
@@ -1722,10 +2185,21 @@ connect(RunService.Heartbeat, function(dt)
         if os.clock() - lastError > 5 then lastError = os.clock(); log("ERROR", err) end
     end
 end)
--- No unbounded WaitForChild: a failed GUI setup must not leave an invisible farmer.
-local playerGui = player:FindFirstChildOfClass("PlayerGui")
-    or player:WaitForChild("PlayerGui", 15)
-if not playerGui then api.Destroy(); error("PlayerGui chua san sang; hay chay lai sau khi vao game") end
-gui.Parent = playerGui
+-- Same 30-second interval as the supplied code (its 90-second comment was stale).
+task.spawn(function()
+    task.wait(2)
+    while alive and sessionSerial == env.__EventMagnetSessionSerial do
+        if enabled and config.HopApiUrl ~= "" and game.JobId ~= "" then
+            -- Only this coroutine sends heartbeats: a hanging HTTP request cannot
+            -- spawn another one, and a stopped/rerun session exits afterwards.
+            pcall(function()
+                workerRequest("/api/heartbeat", {
+                    username = player.Name, jobId = game.JobId, placeId = tostring(game.PlaceId),
+                })
+            end)
+        end
+        task.wait(config.HopHeartbeatInterval)
+    end
+end)
 log("INFO", "Chi quan sat event client; khong xac nhan reward hoac event rieng server")
 return api
