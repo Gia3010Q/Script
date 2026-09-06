@@ -32,6 +32,8 @@ local config = {
     Speed = 190, Weapon = "Melee", ScanInterval = 0.5,
     AttackInterval = 0.25, AttackRange = 60, HoverHeight = 30,
     AttackNoAnimation = true,
+    AutoBuso = true, BusoCheckDelay = 1, BusoRetryDelay = 3,
+    BusoConfirmTimeout = 1.5, UseBusoKeyFallback = true,
     TargetTimeout = 120, NoDamageTimeout = 12, NoProgressTimeout = 12,
     RetryDelay = 20, LogLimit = 80,
     Patrol = true, PatrolHeight = 12, PatrolWait = 1, SpawnTimeout = 1,
@@ -915,6 +917,53 @@ end)
 connect(workspace.ChildRemoved, removeFruitRecord)
 refreshFruits()
 
+-- Auto Buso adapted from auto_factory.lua: remote, HasBuso confirmation,
+-- then J fallback. One session-bound coroutine; never blocks combat Heartbeat.
+do
+    task.spawn(function()
+        local function current(character)
+            local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+            return alive and enabled and config.AutoBuso and env.EventMagnetFarm == api
+                and character ~= nil and character == player.Character and character.Parent ~= nil
+                and humanoid and humanoid.Health > 0
+        end
+        local function confirmed(character, timeout)
+            local deadline = os.clock() + timeout
+            repeat
+                if not current(character) then return false end
+                if character:FindFirstChild("HasBuso") then return true end
+                task.wait(0.1)
+            until os.clock() >= deadline
+            return current(character) and character:FindFirstChild("HasBuso") ~= nil
+        end
+        while alive and env.EventMagnetFarm == api do
+            local character = player.Character
+            local hasBuso = character and character:FindFirstChild("HasBuso") ~= nil
+            if current(character) and not hasBuso then
+                local ok = pcall(function()
+                    local folder = RS:FindFirstChild("Remotes")
+                    local remote = folder and folder:FindFirstChild("CommF_")
+                    if remote and remote:IsA("RemoteFunction") then remote:InvokeServer("Buso") end
+                    hasBuso = confirmed(character, config.BusoConfirmTimeout)
+                    if not hasBuso and config.UseBusoKeyFallback and current(character)
+                        and not character:FindFirstChild("HasBuso") then
+                        local pressed = pcall(function()
+                            VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.J, false, game)
+                            task.wait(0.05)
+                        end)
+                        -- Always release J, even if Stop/respawn happened during the press.
+                        pcall(function() VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.J, false, game) end)
+                        if pressed then hasBuso = confirmed(character, 0.75) end
+                    end
+                end)
+                if alive and env.EventMagnetFarm == api and (not ok or not hasBuso) then
+                    log("BUSO", "Chua xac nhan HasBuso; cho thu lai")
+                end
+            end
+            task.wait(hasBuso and config.BusoCheckDelay or config.BusoRetryDelay)
+        end
+    end)
+end
 -- A single movement owner serves both patrol and combat.
 local function flyTo(root, humanoid, destination, dt, facing)
     if moveRoot ~= root then
