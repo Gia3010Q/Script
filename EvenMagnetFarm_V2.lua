@@ -1,14 +1,10 @@
--- V2: one patrol pass per server, then low-player hop until this event ends.
+-- V2: event = patrol/farm/hop; outside event = collect/store Fruit and wait.
 -- Requires executor loadstring + queue_on_teleport (or equivalent) for continuation.
 -- Existing EvenMagnetFarm.lua is unchanged. Both versions share the singleton.
 local env = (type(getgenv) == "function" and getgenv()) or _G
 if not game:IsLoaded() then game.Loaded:Wait() end
 local ok, now = pcall(function() return workspace:GetServerTimeNow() end)
 if not ok then now = os.time() end
-if now % 3600 >= 600 then
-    warn("[MagnetV2] Event da het/chua bat dau. Chay lai trong 10 phut dau gio.")
-    return
-end
 env.__EventMagnetV2Deadline = math.floor(now / 3600) * 3600 + 600
 local source = [====[
 -- Event Magnet Farm: standalone client script; uses the game's __ServerBrowser
@@ -24,8 +20,8 @@ local eventDeadline = env.__EventMagnetV2Deadline
 local function eventStillOpen()
     local ok, now = pcall(function() return workspace:GetServerTimeNow() end)
     if not ok then now = os.time() end
-    return type(eventDeadline) == "number" and now < eventDeadline
-        and now >= eventDeadline - 600
+    eventDeadline = math.floor(now / 3600) * 3600 + 600
+    return now % 3600 < 600
 end
 local continuationQueued = false
 local previous = env.EventMagnetFarm
@@ -540,6 +536,7 @@ local function cancelAction(reason)
     releaseMovement()
 end
 local function hasLiveMagnetized()
+    if not eventStillOpen() then return false end
     for _, model in ipairs(targets) do
         local humanoid = livingNPC(model)
         if humanoid and isMagnetized(model, humanoid)
@@ -1448,7 +1445,7 @@ local function queueContinuation()
     end
     local configJSON = HttpService:JSONEncode(config)
     local payload = string.format(
-        "local e=getgenv(); e.__EventMagnetV2Source=%q; e.__EventMagnetV2Deadline=%s; e.EventMagnetV2Config=game:GetService('HttpService'):JSONDecode(%q); if not game:IsLoaded() then game.Loaded:Wait() end; if workspace:GetServerTimeNow()<e.__EventMagnetV2Deadline then local f,err=loadstring(e.__EventMagnetV2Source); assert(f,err); f() end",
+        "local e=getgenv(); e.__EventMagnetV2Source=%q; e.__EventMagnetV2Deadline=%s; e.EventMagnetV2Config=game:GetService('HttpService'):JSONDecode(%q); if not game:IsLoaded() then game.Loaded:Wait() end; local f,err=loadstring(e.__EventMagnetV2Source); assert(f,err); f()",
         continuationSource, tostring(eventDeadline), configJSON)
     local ok, err = pcall(queue, payload)
     if not ok then
@@ -2220,12 +2217,15 @@ local function recoverFromSeat(root, humanoid, now)
     return false
 end
 local function farmStep(dt)
-    if not eventStillOpen() then
-        if enabled then api.SetEnabled(false); restoreBring(); restoreSeatGuard() end
-        status = "Het su kien: V2 da dung. Chay lai vao su kien tiep theo."
-        return
-    end
     if not enabled then return end
+    if not eventStillOpen() then
+        if target then resetTarget("het event; chuyen sang Fruit") end
+        restoreBring()
+        if action.kind == "hop" and not hop.dispatched then cancelAction("het event; dung tim server") end
+        if action.kind == "portal" and (portal.forCombat or not fruitTask.target) then
+            cancelAction("het event; chuyen sang Fruit")
+        end
+    end
     local now = os.clock()
     if not teamSelectionStep(now) then
         releaseMovement()
@@ -2265,7 +2265,7 @@ local function farmStep(dt)
         -- Sea 1 remains island-scoped. Sea 2/3 may acquire any replicated
         -- Magnetized target and always preempt every lower-priority task.
         local nearest = math.huge
-        if not islandMode or patrol.current then
+        if eventWindow.active and (not islandMode or patrol.current) then
             for _, model in ipairs(targets) do
                 local h, r = livingNPC(model)
                 local onCurrentIsland = not islandMode or (r and patrol.current
@@ -2314,7 +2314,7 @@ local function farmStep(dt)
                 and not eventWindow.active and fruitStep(root, humanoid, dt, now) then return end
             if config.EventScheduleEnabled and not eventWindow.active then
                 releaseMovement()
-                status = "Cho event dau gio | con " .. math.ceil(eventWindow.remaining) .. "s"
+                status = "Ngoai event: cho Fruit | event sau " .. math.ceil(eventWindow.remaining) .. "s"
                 return
             end
             patrolStep(root, humanoid, dt, now)
