@@ -2043,9 +2043,11 @@ local function farmStep(dt)
                 end
             end
 
-            -- Do not collect more Fruit while an owned Fruit cannot be stored;
-            -- patrol still continues so Magnetized farming is never blocked.
-            if #owned == 0 and (hop.checked or hop.blocked)
+            -- Rejected Tools stay in the bag but must not block the next pickup.
+            -- A new/unresolved Tool still waits for its store attempt. Holding a
+            -- rejected Tool also prevents hop, so allow pickup before hop.checked.
+            local pendingStore = #owned - blocked
+            if pendingStore == 0 and (hop.checked or hop.blocked or blocked > 0)
                 and not eventWindow.active and fruitStep(root, humanoid, dt, now) then return end
             if config.EventScheduleEnabled and not eventWindow.active then
                 releaseMovement()
