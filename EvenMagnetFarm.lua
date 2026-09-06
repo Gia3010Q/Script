@@ -2289,8 +2289,9 @@ connect(RunService.Stepped, function()
     end
 end)
 
--- Keep dashboard locals out of the farm's top-level register scope.
-do
+-- A do/end scope still counts the outer locals toward Luau's local limit.
+-- A separate function gives the dashboard its own register frame.
+local function mountDashboard()
 local gui = Instance.new("ScreenGui")
 gui.Name, gui.ResetOnSpawn, gui.DisplayOrder = "EventMagnetFarmUI", false, 1000
 gui.IgnoreGuiInset = true
@@ -2657,6 +2658,7 @@ task.spawn(function()
         task.wait(config.HopHeartbeatInterval)
     end
 end)
-end -- dashboard scope
+end -- dashboard function
+mountDashboard()
 log("INFO", "Chi quan sat event client; khong xac nhan reward hoac event rieng server")
 return api
