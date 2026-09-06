@@ -49,6 +49,7 @@ local config = {
     FruitScanInterval = 1, FruitPickupDistance = 6, FruitPickupConfirm = 2,
     FruitPickupAttempts = 3, FruitRetryDelay = 60,
     StoreFruit = true, StoreRetryDelay = 15, StoreAttempts = 3,
+    AutoRandomToken = true, WebhookURL = "",
     BringMobs = true, BringMobCount = 2, BringMobRadius = 200,
     BringActivationRange = 50, BringPlayerSafeRange = 300, BringMobInterval = 0.1,
     StartupHop = true, StartupDelay = 5, CurrentPlayerLimit = 4,
@@ -341,6 +342,9 @@ local fruitRecords = setmetatable({}, { __mode = "k" })
 local storeRecords = setmetatable({}, { __mode = "k" })
 local fruitTask = { target = nil, started = nil, best = math.huge, progress = 0 }
 local hop = { busy = false, retryAt = 0, status = "Cho kiem tra dau phien" }
+local randomToken = { busy = false, locked = false, retryAt = 0, serial = 0,
+    status = "Tu quay khi du 500 token" }
+if type(env.WebhookURL) == "string" then config.WebhookURL = env.WebhookURL end
 local eventWindow = { active = false, cycle = nil, remaining = 0 }
 local function readEventWindow(timestamp)
     local elapsed = timestamp % 3600
@@ -829,7 +833,7 @@ local function getStoreSummary()
     return owned, blocked, waiting
 end
 local function startStore(item, force)
-    if not config.StoreFruit or action.kind then return false end
+    if not config.StoreFruit or action.kind or randomToken.busy then return false end
     local record = storeRecords[item] or { attempts = 0, retryAt = 0, blocked = false }
     storeRecords[item] = record
     if not force and (record.blocked or record.retryAt > os.clock()) then return false end
@@ -1211,7 +1215,7 @@ local function saveVisitedServer(id)
 end
 local function hopAllowed(token)
     return actionIsCurrent("hop", token) and not eventWindow.active
-        and not hasLiveMagnetized() and #ownedFruitTools() == 0
+        and not hasLiveMagnetized() and #ownedFruitTools() == 0 and not randomToken.busy
 end
 local function hopRequest(options)
     local requestFn = (type(http_request) == "function" and http_request)
@@ -1376,7 +1380,7 @@ local function requestHopTeleport(token, candidate)
     return "retry"
 end
 local function startHop()
-    if hop.busy or hop.checked or hop.blocked or action.kind or eventWindow.active then return false end
+    if hop.busy or hop.checked or hop.blocked or action.kind or randomToken.busy or eventWindow.active then return false end
     local token = beginAction("hop")
     if not token then return false end
     hop.busy, hop.status = true, "Dang tim server it nguoi"
@@ -1455,12 +1459,19 @@ for _, name in ipairs({
 }) do
     patrolBossNames[name:lower():gsub("[^%w]", "")] = true
 end
+-- User-excluded Sea 2 camps. Filter both seed routes and live spawn markers
+-- before merging, so marker refresh cannot reintroduce Kingdom of Rose stops.
+local kingdomOfRoseCamps = {
+    raider = true, mercenary = true, swanpirate = true, factorystaff = true,
+    kingdomofrose = true,
+}
 local function addPatrolPoint(name, position, source)
     -- Boss respawn timers are not farm camps. Filter before stripping [Boss]
     -- or merging nearby markers, so they never add a stop to the patrol route.
     local spawnName = string.lower(tostring(name or ""))
     local bareName = spawnName:gsub("%b[]", ""):gsub("%s+", " "):match("^%s*(.-)%s*$")
     local bossKey = bareName:gsub("magnetized", ""):gsub("[^%w]", "")
+    if sea == 2 and kingdomOfRoseCamps[bossKey] then return false end
     if spawnName:find("%f[%a]boss%f[%A]") or patrolBossNames[bossKey]
         or bossKey:match("^ripindra") then
         return false
@@ -1839,6 +1850,118 @@ local function fruitStep(root, humanoid, dt, now)
     return true
 end
 
+local function randomEventOpen()
+    local ok, now = pcall(function() return workspace:GetServerTimeNow() end)
+    if not ok then now = os.time() end
+    return now % 3600 < 600
+end
+-- Check/Purchase schema verified from the user's MagnetRandomTest output.
+local function randomTokenStep()
+    if not alive or not enabled or not config.AutoRandomToken or randomToken.locked
+        or randomToken.busy or action.kind or not randomEventOpen()
+        or hasLiveMagnetized() or os.clock() < randomToken.retryAt then return end
+    local character = player.Character
+    local hum = character and character:FindFirstChildOfClass("Humanoid")
+    if not hum or hum.Health <= 0 or not currentTeamName() then return end
+    local owned, blocked = getStoreSummary()
+    if #owned > blocked then return end
+    local modules = RS:FindFirstChild("Modules")
+    local net = modules and modules:FindFirstChild("Net")
+    local rf = net and net:FindFirstChild("RF/GachaNetworkRF")
+    if not rf or not rf:IsA("RemoteFunction") then
+        randomToken.retryAt = os.clock() + 5; return
+    end
+    randomToken.busy = true
+    randomToken.serial = randomToken.serial + 1
+    local serial = randomToken.serial
+    local function current()
+        return alive and env.EventMagnetFarm == api and randomToken.serial == serial
+    end
+    task.delay(12, function()
+        if current() and randomToken.busy then
+            randomToken.locked, randomToken.status = true, "Timeout: khoa random, cho ket qua"
+        end
+    end)
+    task.spawn(function()
+        local dispatched = false
+        local ok = pcall(function()
+            local a, b = rf:InvokeServer({Context = "Check", BoxName = "MagnetEventGacha26"})
+            if not current() then return end
+            local req = type(b) == "table" and b or (type(a) == "table" and a)
+            local price = req and req.Price
+            if not req or type(req.RequirementsMet) ~= "boolean" or type(price) ~= "table"
+                or tonumber(price.ItemId) ~= 1574 or tonumber(price.Value) ~= 500
+                or type(price.Current) ~= "number" then
+                randomToken.locked, randomToken.status = true, "Du lieu/gia thay doi: dung random"
+                return
+            end
+            if price.Current < 500 or price.RequirementMet ~= true then
+                randomToken.status, randomToken.retryAt = "Token " .. price.Current .. "/500", os.clock() + 10
+                return
+            end
+            if req.RequirementsMet ~= true or (type(req.Cooldown) == "table" and req.Cooldown.RequirementMet == false) then
+                randomToken.status, randomToken.retryAt = "Cho cooldown/dieu kien", os.clock() + 3
+                return
+            end
+            if not enabled or not config.AutoRandomToken or randomToken.locked or not randomEventOpen()
+                or action.kind or hasLiveMagnetized() or player.Character ~= character or hum.Health <= 0 then return end
+            local before = {}
+            for _, item in ipairs(ownedFruitTools()) do before[item] = true end
+            dispatched = true
+            randomToken.status = "Quay 500 Magnet Token"
+            local accepted, details = rf:InvokeServer({Context = "Purchase", BoxName = "MagnetEventGacha26"})
+            if not current() then return end
+            if accepted == false then
+                randomToken.status, randomToken.retryAt = "Server tu choi; Check lai", os.clock() + 3
+                return
+            elseif accepted ~= true then
+                randomToken.locked, randomToken.status = true, "Purchase chua ro; dung random"
+                return
+            end
+            task.wait(2)
+            if not current() then return end
+            local rewards = {}
+            for _, item in ipairs(ownedFruitTools()) do
+                if not before[item] then rewards[#rewards + 1] = item.Name end
+            end
+            randomToken.status = #rewards > 0 and ("Nhan " .. table.concat(rewards, ", "))
+                or "Server chap nhan; chua thay Fruit"
+            log("RANDOM", randomToken.status)
+            local url, message = config.WebhookURL, randomToken.status
+            if type(url) == "string" and url:match("^https://") then
+                task.spawn(function()
+                    if not alive then return end
+                    local sent, response = pcall(function()
+                        return hopRequest({Url = url, Method = "POST",
+                            Headers = {["Content-Type"] = "application/json"},
+                            Body = HttpService:JSONEncode({username = "Magnet Farm",
+                                allowed_mentions = {parse = {}}, embeds = {{
+                                    title = "Magnet Token Random", description = message,
+                                    fields = {{name = "Player", value = player.Name},
+                                        {name = "PlaceId", value = tostring(game.PlaceId)},
+                                        {name = "Token truoc quay", value = tostring(price.Current)}},
+                                    footer = {text = "Dev By Gia Yêu Em"},
+                                    timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+                                }}})})
+                    end)
+                    if alive and (not sent or type(response) ~= "table"
+                        or (tonumber(response.StatusCode) or 0) < 200
+                        or (tonumber(response.StatusCode) or 0) >= 300) then
+                        log("WEBHOOK", "Gui that bai; khong tu gui lai")
+                    end
+                end)
+            end
+            randomToken.retryAt = os.clock() + 3
+        end)
+        if not current() then return end
+        if not ok then
+            randomToken.locked = dispatched or randomToken.locked
+            randomToken.status = dispatched and "Purchase loi; khoa random" or "Check loi; thu lai sau"
+            randomToken.retryAt = os.clock() + 10
+        end
+        randomToken.busy = false
+    end)
+end
 -- Adapted from giayeuem.lua SourceBringMob: same radius/count/throttle and
 -- other-player guard, but only living Magnetized NPCs are eligible.
 local bringState = { at = 0, parts = setmetatable({}, { __mode = "k" }) }
@@ -2343,6 +2466,7 @@ local function counterRow(parent, x, y, labelText, valueColor)
 end
 local magnetizedValue = counterRow(counterCard, 16, 7, "Magnetized", C.green)
 local ownedValue = counterRow(counterCard, 16, 34, "Giữ", C.green)
+local randomValue = text(counterCard, "Auto token: ON", 16, 61, 175, 26, 10, C.cyan, false)
 local eventCountValue = counterRow(counterCard, 210, 7, "Event", C.yellow)
 local fruitMapValue = counterRow(counterCard, 210, 34, "Fruit map", C.yellow)
 local waitBlockValue = counterRow(counterCard, 210, 61, "Chờ/chặn", C.yellow)
@@ -2473,6 +2597,7 @@ connect(RunService.Heartbeat, function(dt)
         end
         updateEventWindow()
         farmStep(dt)
+        randomTokenStep()
         if uiClock >= 0.3 then
             uiClock = 0
             toggle.Text = enabled and "DỪNG FARM" or "BẬT FARM"
@@ -2498,6 +2623,7 @@ connect(RunService.Heartbeat, function(dt)
 
             magnetizedValue.Text = tostring(#targets)
             ownedValue.Text = tostring(#owned)
+            randomValue.Text = randomToken.status
             eventCountValue.Text = tostring(eventCount)
             fruitMapValue.Text = tostring(fruitCount)
             waitBlockValue.Text = tostring(waiting) .. " / " .. tostring(blocked)
