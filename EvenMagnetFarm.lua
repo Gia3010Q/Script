@@ -291,6 +291,8 @@ for key, value in pairs(config) do
         config[key] = key == "WaterWalkSurfaceY" and value or math.max(value, 0.05)
     end
 end
+-- Haki is mandatory, including each respawn; do not allow a disabled retry loop.
+config.AutoBuso = true
 config.LogLimit = math.clamp(math.floor(config.LogLimit), 10, 300)
 config.ScanInterval = math.max(config.ScanInterval, 0.2)
 config.AttackInterval = math.max(config.AttackInterval, 0.1)
@@ -1263,6 +1265,8 @@ local function saveVisitedServer(id)
     pcall(function() TeleportService:SetTeleportSetting("EventMagnetHopTTL", hopVisited) end)
 end
 local function hopAllowed(token)
+    local character = player.Character
+    if not character or not character:FindFirstChild("HasBuso") then return false end
     return actionIsCurrent("hop", token) and not eventWindow.active
         and not hasLiveMagnetized() and #ownedFruitTools() == 0 and not randomToken.busy
 end
@@ -1911,7 +1915,8 @@ local function randomTokenStep()
         or hasLiveMagnetized() or os.clock() < randomToken.retryAt then return end
     local character = player.Character
     local hum = character and character:FindFirstChildOfClass("Humanoid")
-    if not hum or hum.Health <= 0 or not currentTeamName() then return end
+    if not hum or hum.Health <= 0 or not currentTeamName()
+        or not character:FindFirstChild("HasBuso") then return end
     local owned, blocked = getStoreSummary()
     if #owned > blocked then return end
     local modules = RS:FindFirstChild("Modules")
@@ -1954,6 +1959,7 @@ local function randomTokenStep()
             end
             if not enabled or not config.AutoRandomToken or randomToken.locked or not randomEventOpen()
                 or action.kind or hasLiveMagnetized() or player.Character ~= character or hum.Health <= 0 then return end
+            if not character:FindFirstChild("HasBuso") then return end
             local before = {}
             for _, item in ipairs(ownedFruitTools()) do before[item] = true end
             dispatched = true
@@ -2144,6 +2150,12 @@ local function farmStep(dt)
     local root = rootOf(character)
     if not humanoid or humanoid.Health <= 0 or not root then
         resetTarget(); status = "Cho respawn..."; return
+    end
+    if not character:FindFirstChild("HasBuso") then
+        releaseMovement()
+        if action.kind and not hop.dispatched then cancelAction("cho Haki bat buoc") end
+        status = "Cho bat Haki Buso bat buoc; chua xac nhan HasBuso"
+        return
     end
     hop.readyAt = hop.readyAt or (now + config.StartupDelay)
     if recoverFromSeat(root, humanoid, now) then return end
