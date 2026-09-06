@@ -6,6 +6,8 @@
 -- "magnetized" (case insensitive). Generic Magnet tags are diagnostic only.
 -- Optional overrides BEFORE running: getgenv().EventMagnetConfig = { Enabled = false }
 local env = (type(getgenv) == "function" and getgenv()) or _G
+-- Same readiness gate as giayeuem.lua, before replacing the active session.
+repeat task.wait() until game:IsLoaded() and game:GetService("Players").LocalPlayer
 local previous = env.EventMagnetFarm
 if type(previous) == "table" and type(previous.Destroy) == "function" then
     previous.Destroy()
@@ -405,6 +407,17 @@ local function currentTeamName()
     return (name == "Pirates" or name == "Marines") and name or nil
 end
 local function teamSelectionStep(now)
+    -- Do not wait for Map/Character here: those can depend on choosing a team.
+    if not game:IsLoaded() or not player:FindFirstChildOfClass("PlayerGui") then
+        teamSelect.loadReadyAt = nil
+        teamSelect.lastResult = "Cho game load / PlayerGui"
+        return false
+    end
+    teamSelect.loadReadyAt = teamSelect.loadReadyAt or (now + 5)
+    if now < teamSelect.loadReadyAt then
+        teamSelect.lastResult = "Cho on dinh game " .. math.ceil(teamSelect.loadReadyAt - now) .. "s truoc chon team"
+        return false
+    end
     local selected = currentTeamName()
     if selected then
         if not teamSelect.ready or teamSelect.lastResult ~= "Da vao " .. selected then

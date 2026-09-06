@@ -24,6 +24,8 @@ local function eventStillOpen()
     return now % 3600 < 600
 end
 local continuationQueued = false
+-- Same readiness gate as giayeuem.lua, before replacing the active session.
+repeat task.wait() until game:IsLoaded() and game:GetService("Players").LocalPlayer
 local previous = env.EventMagnetFarm
 if type(previous) == "table" and type(previous.Destroy) == "function" then
     previous.Destroy()
@@ -72,7 +74,7 @@ local config = {
     AutoRandomToken = true, WebhookURL = "",
     BringMobs = true, BringMobCount = 2, BringMobRadius = 200,
     BringActivationRange = 50, BringPlayerSafeRange = 300, BringMobInterval = 0.1,
-    StartupHop = false, StartupDelay = 5, CurrentPlayerLimit = 4,
+    StartupHop = true, StartupDelay = 5, CurrentPlayerLimit = 4,
     TargetExistingPlayers = 3, HopMaxPages = 30, HopCandidates = 3,
     HopRequestRetries = 3, HopRetryDelay = 60, HopTeleportTimeout = 10,
     HopBrowserTimeout = 8,
@@ -367,7 +369,7 @@ local hop = { busy = false, retryAt = 0, status = "Cho kiem tra dau phien" }
 local randomToken = { busy = false, locked = false, retryAt = 0, serial = 0,
     status = "Tu quay khi du 500 token" }
 if type(env.WebhookURL) == "string" then config.WebhookURL = env.WebhookURL end
-config.EventScheduleEnabled, config.EventDurationSeconds, config.StartupHop = true, 600, false
+config.EventScheduleEnabled, config.EventDurationSeconds, config.StartupHop = true, 600, true
 config.HopMaxPlayers = math.min(config.HopMaxPlayers, config.TargetExistingPlayers)
 local eventWindow = { active = false, cycle = nil, remaining = 0 }
 local function readEventWindow(timestamp)
@@ -425,6 +427,17 @@ local function currentTeamName()
     return (name == "Pirates" or name == "Marines") and name or nil
 end
 local function teamSelectionStep(now)
+    -- Do not wait for Map/Character here: those can depend on choosing a team.
+    if not game:IsLoaded() or not player:FindFirstChildOfClass("PlayerGui") then
+        teamSelect.loadReadyAt = nil
+        teamSelect.lastResult = "Cho game load / PlayerGui"
+        return false
+    end
+    teamSelect.loadReadyAt = teamSelect.loadReadyAt or (now + 5)
+    if now < teamSelect.loadReadyAt then
+        teamSelect.lastResult = "Cho on dinh game " .. math.ceil(teamSelect.loadReadyAt - now) .. "s truoc chon team"
+        return false
+    end
     local selected = currentTeamName()
     if selected then
         if not teamSelect.ready or teamSelect.lastResult ~= "Da vao " .. selected then
@@ -1327,8 +1340,8 @@ end
 local function hopAllowed(token)
     local character = player.Character
     if not character or not character:FindFirstChild("HasBuso") then return false end
-    return actionIsCurrent("hop", token) and eventStillOpen()
-        and not hasLiveMagnetized() and not hasMythicalFruit() and not randomToken.busy
+    return actionIsCurrent("hop", token) and (hop.startup or eventStillOpen())
+        and (hop.startup or not hasLiveMagnetized()) and not hasMythicalFruit() and not randomToken.busy
 end
 local function hopRequest(options)
     local requestFn = (type(http_request) == "function" and http_request)
@@ -1513,8 +1526,10 @@ local function requestHopTeleport(token, candidate)
     log("HOP", hop.status)
     return "retry"
 end
-local function startHop()
-    if hop.busy or hop.blocked or action.kind or randomToken.busy or not eventStillOpen() then return false end
+local function startHop(startup)
+    if hop.busy or hop.blocked or action.kind or randomToken.busy
+        or (not startup and not eventStillOpen()) then return false end
+    hop.startup = startup == true
     local token = beginAction("hop")
     if not token then return false end
     hop.busy, hop.status = true, "Dang tim server it nguoi"
@@ -2222,12 +2237,14 @@ local function recoverFromSeat(root, humanoid, now)
     end
     return false
 end
+-- Recheck population on every entry, even if a previous hop chose this server.
+hop.checked = false
 local function farmStep(dt)
     if not enabled then return end
     if not eventStillOpen() then
         if target then resetTarget("het event; chuyen sang Fruit") end
         restoreBring()
-        if action.kind == "hop" and not hop.dispatched then cancelAction("het event; dung tim server") end
+        if action.kind == "hop" and not hop.startup and not hop.dispatched then cancelAction("het event; dung tim server") end
         if action.kind == "portal" and (portal.forCombat or not fruitTask.target) then
             cancelAction("het event; chuyen sang Fruit")
         end
@@ -2252,12 +2269,29 @@ local function farmStep(dt)
     end
     hop.readyAt = hop.readyAt or (now + config.StartupDelay)
     if recoverFromSeat(root, humanoid, now) then return end
+    if not hop.checked and not hop.blocked and not action.kind then
+        if now < hop.readyAt then
+            releaseMovement()
+            status = "Cho kiem tra server dau phien " .. math.ceil(hop.readyAt - now) .. "s"
+            return
+        elseif #Players:GetPlayers() <= config.CurrentPlayerLimit then
+            hop.checked, hop.status = true, "Server trong gioi han " .. config.CurrentPlayerLimit .. " nguoi"
+        elseif hasMythicalFruit() then
+            hop.status = "Chan hop dau phien: con Mythical chua luu"
+            -- Continue into storage/farming while retaining the startup check.
+        elseif now >= hop.retryAt then
+            startHop(true)
+            status = hop.status
+            return
+        end
+    end
 
     if config.EventScheduleEnabled and not eventWindow.active and action.kind == "portal"
         and not portal.forCombat and not fruitTask.target then
         cancelAction("het gio event; dung Portal tuan tra")
     end
     if hasLiveMagnetized() and action.kind and not hop.dispatched
+        and not (action.kind == "hop" and hop.startup)
         and not (action.kind == "portal" and portal.forCombat) then
         cancelAction("nhuong Magnetized")
     end
@@ -2299,24 +2333,6 @@ local function farmStep(dt)
                 end
             end
 
-            if not config.StartupHop then
-                hop.checked, hop.status = true, "Hop dau phien dang tat"
-            elseif not hop.checked and not hop.blocked and not eventWindow.active then
-                if now < hop.readyAt then
-                    status = "Cho on dinh dau phien " .. math.ceil(hop.readyAt - now) .. "s"
-                    return
-                elseif #Players:GetPlayers() <= config.CurrentPlayerLimit then
-                    hop.checked, hop.status = true, "Da o server <= " .. config.CurrentPlayerLimit .. " nguoi"
-                    serverChoiceMemory[game.JobId] = true
-                    log("HOP", hop.status)
-                elseif #owned > 0 then
-                    hop.status = "Chan hop: con " .. #owned .. " Fruit chua luu"
-                    status = hop.status .. (blocked > 0 and " (can RetryStore sau khi xu ly kho)" or "")
-                elseif now >= hop.retryAt and startHop() then
-                    status = hop.status
-                    return
-                end
-            end
 
             -- Rejected Tools stay in the bag but must not block the next pickup.
             -- A new/unresolved Tool still waits for its store attempt. Holding a
