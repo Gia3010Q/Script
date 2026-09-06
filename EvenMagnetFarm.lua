@@ -282,7 +282,8 @@ for key, value in pairs(config) do
         if value ~= value or value == math.huge or value == -math.huge then
             error("Invalid EventMagnetConfig." .. key)
         end
-        config[key] = math.max(value, 0.05)
+        -- World coordinates may be negative; only durations/distances need a floor.
+        config[key] = key == "WaterWalkSurfaceY" and value or math.max(value, 0.05)
     end
 end
 config.LogLimit = math.clamp(math.floor(config.LogLimit), 10, 300)
@@ -1086,6 +1087,7 @@ local function tryStartPortal(targetPosition, root, humanoid, forCombat)
     end
     local name = bestPortalFor(targetPosition, root.Position)
     if not name then
+        portal.lastResult = "Khong co diem Portal gan dich; bay 190"
         if openGateway() then pcall(closePortalMenu) end
         return false
     end
@@ -1430,12 +1432,28 @@ local function islandAt(position)
     end
     return name
 end
+-- Exact normalized names also cover spawn markers without a [Boss] suffix.
+local patrolBossNames = {}
+for _, name in ipairs({
+    "Gorilla King", "Bobby", "The Saw", "Yeti", "Mob Leader", "Vice Admiral",
+    "Warden", "Chief Warden", "Swan", "Magma Admiral", "Fishman Lord",
+    "Wysper", "Thunder God", "Cyborg", "Saber Expert", "Greybeard",
+    "Diamond", "Jeremy", "Fajita", "Don Swan", "Darkbeard", "Order",
+    "Smoke Admiral", "Cursed Captain", "Awakened Ice Admiral", "Tide Keeper",
+    "Stone", "Island Empress", "Kilo Admiral", "Captain Elephant",
+    "Beautiful Pirate", "Longma", "Soul Reaper", "Cake Queen",
+    "Cake Prince", "Dough King", "rip_indra", "rip_indra True Form",
+}) do
+    patrolBossNames[name:lower():gsub("[^%w]", "")] = true
+end
 local function addPatrolPoint(name, position, source)
     -- Boss respawn timers are not farm camps. Filter before stripping [Boss]
     -- or merging nearby markers, so they never add a stop to the patrol route.
     local spawnName = string.lower(tostring(name or ""))
     local bareName = spawnName:gsub("%b[]", ""):gsub("%s+", " "):match("^%s*(.-)%s*$")
-    if spawnName:find("%f[%a]boss%f[%A]") or bareName == "don swan" then
+    local bossKey = bareName:gsub("magnetized", ""):gsub("[^%w]", "")
+    if spawnName:find("%f[%a]boss%f[%A]") or patrolBossNames[bossKey]
+        or bossKey:match("^ripindra") then
         return false
     end
     if typeof(position) ~= "Vector3" then return false end
@@ -1812,15 +1830,46 @@ local function fruitStep(root, humanoid, dt, now)
     return true
 end
 
+local seatGuard = { humanoid = nil, original = nil }
+local function restoreSeatGuard()
+    if seatGuard.humanoid and seatGuard.humanoid.Parent then
+        pcall(function()
+            seatGuard.humanoid:SetStateEnabled(Enum.HumanoidStateType.Seated, seatGuard.original)
+        end)
+    end
+    seatGuard.humanoid, seatGuard.original = nil, nil
+end
+local function updateSeatGuard()
+    local character = player.Character
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    if seatGuard.humanoid ~= humanoid or not enabled or not alive then restoreSeatGuard() end
+    if not alive or not enabled or not humanoid or humanoid.Health <= 0 then return end
+    if not seatGuard.humanoid then
+        seatGuard.original = humanoid:GetStateEnabled(Enum.HumanoidStateType.Seated)
+        seatGuard.humanoid = humanoid
+    end
+    humanoid:SetStateEnabled(Enum.HumanoidStateType.Seated, false)
+end
 local seatRecovery = { root = nil, nextAttempt = 0, pending = false }
 local function recoverFromSeat(root, humanoid, now)
     if seatRecovery.root ~= root then
         seatRecovery.root, seatRecovery.nextAttempt, seatRecovery.pending = root, 0, false
+        seatRecovery.started, seatRecovery.clearSince = nil, nil
     end
     if humanoid.Sit or humanoid.SeatPart then
         releaseMovement()
         seatRecovery.pending = true
+        seatRecovery.started = seatRecovery.started or now
+        seatRecovery.clearSince = nil
         status = "Dang tu roi ghe de tiep tuc farm"
+        if now - seatRecovery.started >= 6 then
+            api.SetEnabled(false)
+            restoreSeatGuard()
+            status = "Ghe chua nha sau 6s; hay nhay roi ghe va bat lai farm"
+            log("SEAT", status)
+            seatRecovery.started = nil
+            return true
+        end
         if now >= seatRecovery.nextAttempt then
             seatRecovery.nextAttempt = now + 0.5
             humanoid.PlatformStand = false
@@ -1831,13 +1880,18 @@ local function recoverFromSeat(root, humanoid, now)
         return true
     end
     if seatRecovery.pending then
+        seatRecovery.clearSince = seatRecovery.clearSince or now
+        if now - seatRecovery.clearSince < 0.2 then return true end
         -- Chỉ nâng nhân vật sau khi SeatPart đã nhả để không kéo theo ghế/thuyền.
         seatRecovery.pending = false
+        seatRecovery.started, seatRecovery.clearSince = nil, nil
         root.AssemblyLinearVelocity = Vector3.zero
         root.AssemblyAngularVelocity = Vector3.zero
         root.CFrame = root.CFrame + Vector3.new(0, 12, 0)
         patrol.started, patrol.arrived, patrol.seenAt = nil, nil, nil
         patrol.progress, patrol.best = now, math.huge
+        lastProgress, lastDamage, bestDistance = now, now, math.huge
+        fruitTask.progress, fruitTask.best = now, math.huge
         status = "Da roi ghe; tiep tuc farm"
         log("FARM", status)
     end
@@ -2010,7 +2064,11 @@ local function updateWaterWalk()
     )
     local surface = config.WaterWalkSurfaceY
     local hitName = hit and string.lower(hit.Instance.Name) or ""
-    if hit and (hit.Material == Enum.Material.Water or hitName == "sea"
+    local nearWaterLevel = root.Position.Y >= surface - 15 and root.Position.Y <= surface + 12.5
+    if nearWaterLevel then
+        -- Fixed-level support from Auto Factory, even if a mob/prop blocks the ray.
+        surface = config.WaterWalkSurfaceY
+    elseif hit and (hit.Material == Enum.Material.Water or hitName == "sea"
         or hitName:find("water", 1, true) or hitName:find("ocean", 1, true)) then
         surface = hit.Position.Y
     elseif hit and hit.Position.Y > surface - 8 then
@@ -2043,6 +2101,8 @@ connect(RunService.Stepped, function()
     end
 end)
 
+-- Keep dashboard locals out of the farm's top-level register scope.
+do
 local gui = Instance.new("ScreenGui")
 gui.Name, gui.ResetOnSpawn, gui.DisplayOrder = "EventMagnetFarmUI", false, 1000
 gui.IgnoreGuiInset = true
@@ -2074,33 +2134,231 @@ if not mounted then
     gui:Destroy()
     error("Khong the hien EventMagnetFarmUI qua gethui/CoreGui/PlayerGui")
 end
+local UIS = game:GetService("UserInputService")
+
+-- Compact Dashboard V2: UI-only replacement. Farm/event/patrol/portal/hop logic stays unchanged.
+local C = {
+    bg = Color3.fromRGB(7, 16, 28),
+    card = Color3.fromRGB(10, 25, 40),
+    card2 = Color3.fromRGB(11, 29, 46),
+    border = Color3.fromRGB(0, 160, 255),
+    borderSoft = Color3.fromRGB(18, 112, 180),
+    text = Color3.fromRGB(232, 242, 255),
+    muted = Color3.fromRGB(145, 184, 220),
+    cyan = Color3.fromRGB(38, 181, 255),
+    green = Color3.fromRGB(50, 244, 128),
+    yellow = Color3.fromRGB(255, 191, 46),
+    red = Color3.fromRGB(225, 43, 72),
+    button = Color3.fromRGB(24, 50, 79),
+}
+
 local panel = Instance.new("Frame")
-panel.Size, panel.Position = UDim2.fromOffset(400, 420), UDim2.new(0, 12, 0.5, -210)
-panel.BackgroundColor3, panel.Parent = Color3.fromRGB(24, 28, 36), gui
-local function label(y, height, size)
-    local item = Instance.new("TextLabel")
-    item.Position, item.Size = UDim2.fromOffset(10, y), UDim2.new(1, -20, 0, height)
-    item.BackgroundTransparency, item.TextSize = 1, size
-    item.TextColor3, item.Font = Color3.fromRGB(225, 233, 245), Enum.Font.Code
-    item.TextXAlignment, item.TextYAlignment = Enum.TextXAlignment.Left, Enum.TextYAlignment.Top
-    item.TextWrapped, item.Parent = true, panel
-    return item
+panel.Name = "CompactDashboard"
+panel.Size = UDim2.fromOffset(420, 474)
+panel.Position = UDim2.new(0, 12, 0.5, -237)
+panel.BackgroundColor3 = C.bg
+panel.BorderSizePixel = 0
+panel.ClipsDescendants = true
+panel.Active = true
+panel.Parent = gui
+
+local panelCorner = Instance.new("UICorner")
+panelCorner.CornerRadius = UDim.new(0, 12)
+panelCorner.Parent = panel
+local panelStroke = Instance.new("UIStroke")
+panelStroke.Color = C.border
+panelStroke.Thickness = 1.5
+panelStroke.Transparency = 0.05
+panelStroke.Parent = panel
+
+local function corner(parent, radius)
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, radius or 8)
+    c.Parent = parent
+    return c
 end
-label(10, 25, 17).Text = "MAGNETIZED FARM | 190 default"
-local statusLabel, listLabel, eventLabel = label(40, 55, 14), label(100, 170, 13), label(275, 90, 12)
-local function button(text, x, width)
-    local item = Instance.new("TextButton")
-    item.Text, item.Position, item.Size = text, UDim2.fromOffset(x, 378), UDim2.fromOffset(width, 30)
-    item.BackgroundColor3, item.TextColor3 = Color3.fromRGB(45, 67, 85), Color3.new(1, 1, 1)
-    item.TextSize, item.Parent = 14, panel
-    return item
+
+local function stroke(parent, color, thickness, transparency)
+    local s = Instance.new("UIStroke")
+    s.Color = color or C.borderSoft
+    s.Thickness = thickness or 1
+    s.Transparency = transparency or 0
+    s.Parent = parent
+    return s
 end
-local toggle, close = button("DUNG FARM", 10, 230), button("THOAT", 250, 140)
+
+local function text(parent, value, x, y, w, h, size, color, bold, xAlign, yAlign)
+    local t = Instance.new("TextLabel")
+    t.BackgroundTransparency = 1
+    t.Position = UDim2.fromOffset(x, y)
+    t.Size = UDim2.fromOffset(w, h)
+    t.Text = value or ""
+    t.TextColor3 = color or C.text
+    t.TextSize = size or 12
+    t.Font = bold and Enum.Font.GothamBold or Enum.Font.Gotham
+    t.TextXAlignment = xAlign or Enum.TextXAlignment.Left
+    t.TextYAlignment = yAlign or Enum.TextYAlignment.Center
+    t.TextWrapped = true
+    t.BorderSizePixel = 0
+    t.Parent = parent
+    return t
+end
+
+local function card(x, y, w, h)
+    local f = Instance.new("Frame")
+    f.Position = UDim2.fromOffset(x, y)
+    f.Size = UDim2.fromOffset(w, h)
+    f.BackgroundColor3 = C.card
+    f.BorderSizePixel = 0
+    f.Parent = panel
+    corner(f, 8)
+    stroke(f, C.borderSoft, 1, 0.08)
+    return f
+end
+
+local function infoCard(x, y, titleText)
+    local f = card(x, y, 194, 48)
+    text(f, titleText, 10, 5, 174, 13, 9, C.muted, true)
+    local value = text(f, "-", 10, 20, 174, 22, 14, C.text, true)
+    return value
+end
+
+-- Header / drag handle.
+local header = Instance.new("Frame")
+header.Name = "DragHandle"
+header.Size = UDim2.new(1, 0, 0, 46)
+header.BackgroundTransparency = 1
+header.Active = true
+header.Parent = panel
+
+local titleLabel = text(header, "MAGNETIZED FARM | 190 default", 14, 6, 270, 32, 14, C.text, true)
+local onDot = text(header, "●", 292, 7, 18, 30, 14, C.green, true, Enum.TextXAlignment.Center)
+local onLabel = text(header, "ON", 309, 7, 34, 30, 12, C.green, true, Enum.TextXAlignment.Left)
+text(header, "—", 349, 6, 24, 30, 16, C.muted, false, Enum.TextXAlignment.Center)
+
+local topClose = Instance.new("TextButton")
+topClose.Name = "TopClose"
+topClose.Position = UDim2.fromOffset(379, 6)
+topClose.Size = UDim2.fromOffset(29, 30)
+topClose.BackgroundTransparency = 1
+topClose.Text = "×"
+topClose.TextColor3 = C.text
+topClose.TextSize = 24
+topClose.Font = Enum.Font.Gotham
+topClose.Parent = header
+
+local divider = Instance.new("Frame")
+divider.Position = UDim2.fromOffset(12, 44)
+divider.Size = UDim2.new(1, -24, 0, 1)
+divider.BackgroundColor3 = C.borderSoft
+divider.BorderSizePixel = 0
+divider.Parent = panel
+
+local teamValue = infoCard(12, 54, "TEAM")
+local eventTimeValue = infoCard(214, 54, "EVENT")
+eventTimeValue.TextColor3 = C.yellow
+local roundValue = infoCard(12, 110, "VÒNG")
+roundValue.TextColor3 = C.yellow
+local areaValue = infoCard(214, 110, islandMode and "ĐẢO" or "BÃI")
+areaValue.TextColor3 = C.yellow
+
+-- Counters.
+local counterCard = card(12, 166, 396, 92)
+local counterDivider = Instance.new("Frame")
+counterDivider.Position = UDim2.fromOffset(198, 10)
+counterDivider.Size = UDim2.fromOffset(1, 72)
+counterDivider.BackgroundColor3 = C.borderSoft
+counterDivider.BorderSizePixel = 0
+counterDivider.Parent = counterCard
+
+local function counterRow(parent, x, y, labelText, valueColor)
+    text(parent, labelText, x, y, 96, 22, 12, C.text, false)
+    return text(parent, "0", x + 98, y, 66, 22, 13, valueColor or C.green, true, Enum.TextXAlignment.Right)
+end
+local magnetizedValue = counterRow(counterCard, 16, 7, "Magnetized", C.green)
+local deliveryValue = counterRow(counterCard, 16, 34, "Nhận", C.green)
+local ownedValue = counterRow(counterCard, 16, 61, "Giữ", C.green)
+local eventCountValue = counterRow(counterCard, 210, 7, "Event", C.yellow)
+local fruitMapValue = counterRow(counterCard, 210, 34, "Fruit map", C.yellow)
+local waitBlockValue = counterRow(counterCard, 210, 61, "Chờ/chặn", C.yellow)
+
+-- Portal / hop summary.
+local systemCard = card(12, 266, 396, 58)
+text(systemCard, "Portal", 14, 5, 55, 22, 11, C.muted, false)
+text(systemCard, ":", 70, 5, 10, 22, 11, C.muted, false)
+local portalValue = text(systemCard, "Chưa dùng", 84, 5, 294, 22, 11, C.green, true)
+text(systemCard, "Hop", 14, 30, 55, 22, 11, C.muted, false)
+text(systemCard, ":", 70, 30, 10, 22, 11, C.muted, false)
+local hopValue = text(systemCard, "Chờ kiểm tra đầu phiên", 84, 30, 294, 22, 11, C.green, true)
+
+-- Target and last 3 logs.
+local targetCard = card(12, 332, 194, 88)
+text(targetCard, "TARGET", 12, 5, 170, 18, 10, C.cyan, true)
+local targetLabel = text(targetCard, "-", 12, 25, 170, 56, 11, C.text, false, Enum.TextXAlignment.Left, Enum.TextYAlignment.Top)
+
+local logCard = card(214, 332, 194, 88)
+text(logCard, "LOG (3)", 12, 5, 170, 18, 10, C.cyan, true)
+local logLabel = text(logCard, "-", 12, 25, 170, 56, 10, C.text, false, Enum.TextXAlignment.Left, Enum.TextYAlignment.Top)
+
+local function button(parent, labelText, x, w, color)
+    local b = Instance.new("TextButton")
+    b.Position = UDim2.fromOffset(x, 428)
+    b.Size = UDim2.fromOffset(w, 34)
+    b.BackgroundColor3 = color
+    b.BorderSizePixel = 0
+    b.Text = labelText
+    b.TextColor3 = Color3.new(1, 1, 1)
+    b.TextSize = 12
+    b.Font = Enum.Font.GothamBold
+    b.AutoButtonColor = true
+    b.Parent = parent
+    corner(b, 8)
+    stroke(b, color == C.red and Color3.fromRGB(255, 72, 100) or C.borderSoft, 1, 0.05)
+    return b
+end
+
+local toggle = button(panel, "DỪNG FARM", 12, 244, C.red)
+local close = button(panel, "THOÁT", 264, 144, C.button)
+
+-- Dragging uses input events only; no extra Heartbeat and no farm logic changes.
+local dragging = false
+local dragInput, dragStart, startPos
+connect(header.InputBegan, function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true
+        dragStart = input.Position
+        startPos = panel.Position
+    end
+end)
+connect(header.InputChanged, function(input)
+    if input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch then
+        dragInput = input
+    end
+end)
+connect(UIS.InputChanged, function(input)
+    if dragging and input == dragInput and dragStart and startPos then
+        local delta = input.Position - dragStart
+        panel.Position = UDim2.new(
+            startPos.X.Scale, startPos.X.Offset + delta.X,
+            startPos.Y.Scale, startPos.Y.Offset + delta.Y
+        )
+    end
+end)
+connect(UIS.InputEnded, function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = false
+        dragInput, dragStart, startPos = nil, nil, nil
+    end
+end)
 function api.Destroy()
     if not alive then return end
     if waterPlatform then waterPlatform:Destroy(); waterPlatform = nil end
     cancelAction("Destroy")
     alive, enabled = false, false
+    restoreSeatGuard()
     resetTarget()
     for _, connection in ipairs(connections) do connection:Disconnect() end
     for _, record in pairs(remotes) do
@@ -2116,6 +2374,7 @@ function api.Destroy()
 end
 connect(toggle.MouseButton1Click, function() api.SetEnabled(not enabled) end)
 connect(close.MouseButton1Click, api.Destroy)
+connect(topClose.MouseButton1Click, api.Destroy)
 connect(player.CharacterRemoving, function()
     cancelAction("CharacterRemoving"); resetTarget(); hop.readyAt = nil; status = "Cho respawn..."
 end)
@@ -2123,6 +2382,10 @@ connect(player.CharacterAdded, function()
     cancelAction("CharacterAdded"); resetTarget(); scanClock = config.ScanInterval
 end)
 connect(RunService.Stepped, function()
+    local ok, err = pcall(updateSeatGuard)
+    if not ok and os.clock() - lastError > 5 then
+        lastError = os.clock(); log("SEAT", short(err, 100))
+    end
     if not moveRoot or not enabled then return end
     local character = player.Character
     if not character then return end
@@ -2149,8 +2412,12 @@ connect(RunService.Heartbeat, function(dt)
         farmStep(dt)
         if uiClock >= 0.3 then
             uiClock = 0
-            toggle.Text = enabled and "DUNG FARM (van do event)" or "BAT FARM"
-            statusLabel.Text = status
+            toggle.Text = enabled and "DỪNG FARM" or "BẬT FARM"
+            toggle.BackgroundColor3 = enabled and C.red or C.button
+            onDot.TextColor3 = enabled and C.green or C.muted
+            onLabel.TextColor3 = enabled and C.green or C.muted
+            onLabel.Text = enabled and "ON" or "OFF"
+
             local visited = 0
             for _, point in ipairs(patrol.points) do
                 if point.visited == patrol.pass then visited = visited + 1 end
@@ -2158,30 +2425,41 @@ connect(RunService.Heartbeat, function(dt)
             local owned, blocked, waiting = getStoreSummary()
             local fruitCount = 0
             for _ in pairs(fruitRecords) do fruitCount = fruitCount + 1 end
-            local rows = { "Team: " .. tostring(currentTeamName() or teamSelect.lastResult),
-                config.EventScheduleEnabled and ((eventWindow.active and "EVENT dang mo | con " or "EVENT tiep theo | ")
-                    .. string.format("%02d:%02d", math.floor(eventWindow.remaining / 60), math.floor(eventWindow.remaining % 60)))
-                    or "Lich event: tat",
-                "Vong " .. patrol.pass .. (islandMode and " | Dao " or " | Bai ") .. visited .. "/" .. #patrol.points,
-                (config.AttackNoAnimation and "Attack No Animation" or "Tool attack")
-                    .. " | Cao +" .. config.HoverHeight,
-                "Magnetized: " .. #targets .. " | Event: " .. eventCount .. " | Nhan: " .. deliveryCount,
-                "Fruit map: " .. fruitCount .. " | Giu: " .. #owned
-                    .. " | Cho/chan: " .. waiting .. "/" .. blocked,
-                "Portal: " .. short(portal.lastResult, 52), "Hop: " .. short(hop.status, 55) }
-            for i = 1, math.min(#targets, 2) do rows[#rows + 1] = short(targets[i].Name, 52) end
-            listLabel.Text = table.concat(rows, "\n")
+
+            teamValue.Text = tostring(currentTeamName() or teamSelect.lastResult)
+            eventTimeValue.Text = config.EventScheduleEnabled
+                and ((eventWindow.active and "MỞ " or "CHỜ ") .. string.format("%02d:%02d", math.floor(eventWindow.remaining / 60), math.floor(eventWindow.remaining % 60)))
+                or "TẮT"
+            roundValue.Text = tostring(patrol.pass)
+            areaValue.Text = tostring(visited) .. " / " .. tostring(#patrol.points)
+
+            magnetizedValue.Text = tostring(#targets)
+            deliveryValue.Text = tostring(deliveryCount)
+            ownedValue.Text = tostring(#owned)
+            eventCountValue.Text = tostring(eventCount)
+            fruitMapValue.Text = tostring(fruitCount)
+            waitBlockValue.Text = tostring(waiting) .. " / " .. tostring(blocked)
+
+            portalValue.Text = short(portal.lastResult, 42)
+            hopValue.Text = short(hop.status, 44)
+
+            local targetRows = {}
+            for i = 1, math.min(#targets, 2) do
+                targetRows[#targetRows + 1] = short(targets[i].Name, 28)
+            end
+            targetLabel.Text = short(status, 95)
+
             local recent = {}
             for i = math.max(1, #logs - 2), #logs do
-                recent[#recent + 1] = "[" .. logs[i].kind .. "] " .. short(logs[i].text, 80)
+                recent[#recent + 1] = "[" .. logs[i].kind .. "] " .. short(logs[i].text, 27)
             end
-            eventLabel.Text = table.concat(recent, "\n")
+            logLabel.Text = #recent > 0 and table.concat(recent, "\n") or "-"
         end
     end)
     if not ok then
         api.SetEnabled(false)
         status = "Loi: da dung farm. Xem GetLogs()."
-        statusLabel.Text = status
+        targetLabel.Text = status
         if os.clock() - lastError > 5 then lastError = os.clock(); log("ERROR", err) end
     end
 end)
@@ -2201,5 +2479,6 @@ task.spawn(function()
         task.wait(config.HopHeartbeatInterval)
     end
 end)
+end -- dashboard scope
 log("INFO", "Chi quan sat event client; khong xac nhan reward hoac event rieng server")
 return api
