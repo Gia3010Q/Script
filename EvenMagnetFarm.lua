@@ -31,7 +31,7 @@ local config = {
     Enabled = true, Team = "Marines", AutoSelectTeam = true,
     TeamRetryInterval = 2, TeamRequestTimeout = 5,
     EventScheduleEnabled = true, EventDurationSeconds = 600,
-    Speed = 170, Weapon = "Melee", ScanInterval = 0.5,
+    Speed = 190, Weapon = "Melee", ScanInterval = 0.5,
     AttackInterval = 0.25, AttackRange = 60, HoverHeight = 30,
     AttackNoAnimation = true,
     AutoBuso = true, BusoCheckDelay = 1, BusoRetryDelay = 3,
@@ -54,6 +54,7 @@ local config = {
     FruitPickupAttempts = 3, FruitRetryDelay = 60,
     StoreFruit = true, StoreRetryDelay = 15, StoreAttempts = 3,
     AutoRandomToken = true, WebhookURL = "",
+    AutoCloseSpinner = true, AutoHideItemNotice = true,
     BringMobs = true, BringMobCount = 2, BringMobRadius = 200,
     BringActivationRange = 50, BringPlayerSafeRange = 300, BringMobInterval = 0.1,
     StartupHop = true, StartupDelay = 5, CurrentPlayerLimit = 4,
@@ -542,6 +543,7 @@ local function resetTarget(reason, skip)
     if target and skip then skipped[target] = os.clock() + config.RetryDelay end
     if target and reason then log("FARM", short(target.Name, 80) .. ": " .. reason) end
     target, attackSince = nil, nil
+    patrol.combatCamp, patrol.combatHumanoid = nil, nil
     bestDistance = math.huge
     patrol.arrived, patrol.started, patrol.best = nil, nil, math.huge
     patrol.seenAt = nil
@@ -932,6 +934,52 @@ end)
 connect(workspace.ChildRemoved, removeFruitRecord)
 refreshFruits()
 
+-- Spinner/banner handling ported from auto_factory.lua; only after our rolls.
+do
+    local spinnerController
+    task.spawn(function()
+        local ok, controller = pcall(function()
+            local controllers = RS:WaitForChild("Controllers", 10)
+            local ui = controllers and controllers:WaitForChild("UI", 10)
+            local module = ui and ui:WaitForChild("Spinner", 10)
+            return module and require(module)
+        end)
+        if alive and env.EventMagnetFarm == api and ok and type(controller) == "table" then
+            spinnerController = controller
+        end
+    end)
+    task.spawn(function()
+        while alive and env.EventMagnetFarm == api do
+            task.wait(0.2)
+            if not alive or env.EventMagnetFarm ~= api then break end
+            if enabled and os.clock() < (randomToken.hideUntil or 0) then
+                pcall(function()
+                    local pg = player:FindFirstChildOfClass("PlayerGui")
+                    if not pg then return end
+                    local window = pg:FindFirstChild("SpinnerWindow")
+                    if config.AutoCloseSpinner and window and window:IsA("ScreenGui") and window.Enabled then
+                        local above = window:FindFirstChild("AboveSpinner")
+                        local navigation = above and above:FindFirstChild("Navigation")
+                        local close = navigation and navigation:FindFirstChild("CloseButton")
+                        if close and close:IsA("GuiObject") and close.Visible then
+                            local closed = false
+                            if spinnerController and type(spinnerController.Close) == "function" then
+                                closed = pcall(function() spinnerController:Close() end)
+                            end
+                            if not closed then window.Enabled = false end
+                        end
+                    end
+                    if config.AutoHideItemNotice then
+                        for _, name in ipairs({"Item", "ItemUI"}) do
+                            local notice = pg:FindFirstChild(name)
+                            if notice and notice:IsA("ScreenGui") then notice.Enabled = false end
+                        end
+                    end
+                end)
+            end
+        end
+    end)
+end
 -- Auto Buso adapted from auto_factory.lua: remote, HasBuso confirmation,
 -- then J fallback. One session-bound coroutine; never blocks combat Heartbeat.
 do
@@ -1976,6 +2024,7 @@ local function randomTokenStep()
             local before = {}
             for _, item in ipairs(ownedFruitTools()) do before[item] = true end
             dispatched = true
+            randomToken.hideUntil = os.clock() + 15
             randomToken.status = "Quay 500 Magnet Token"
             local accepted, details = rf:InvokeServer({Context = "Purchase", BoxName = "MagnetEventGacha26"})
             if not current() then return end
@@ -1988,6 +2037,7 @@ local function randomTokenStep()
             end
             task.wait(2)
             if not current() then return end
+            randomToken.hideUntil = os.clock() + 10
             local rewards = {}
             for _, item in ipairs(ownedFruitTools()) do
                 if not before[item] then rewards[#rewards + 1] = item.Name end
@@ -2150,6 +2200,32 @@ local function recoverFromSeat(root, humanoid, now)
     end
     return false
 end
+-- Match the fought mob to its actual camp, not the interrupted patrol stop.
+local function combatCampAt(position)
+    local best, distance
+    for _, point in ipairs(patrol.points) do
+        local delta = (point.position - position).Magnitude
+        if delta <= point.radius and math.abs(point.position.Y - position.Y) <= config.CampHeightTolerance
+            and (not distance or delta < distance) then best, distance = point, delta end
+    end
+    return best
+end
+local function finishClearedCombatCamp()
+    local point, humanoid = patrol.combatCamp, patrol.combatHumanoid
+    -- Disappearance/timeout is not proof of a kill.
+    if not point or not humanoid or humanoid.Health > 0 then return end
+    for model in pairs(mobs) do
+        local h, r = livingNPC(model)
+        if h and isMagnetized(model, h)
+            and (r.Position - point.position).Magnitude <= point.radius
+            and math.abs(r.Position.Y - point.position.Y) <= config.CampHeightTolerance then return end
+    end
+    point.visited, point.retryAt = patrol.pass, 0
+    if patrol.current == point then
+        patrol.current, patrol.arrived, patrol.started, patrol.seenAt = nil, nil, nil, nil
+    end
+    log("PATROL", "Da danh het Magnetized dang hien dien: bo qua bai " .. point.name .. " trong vong nay")
+end
 local function farmStep(dt)
     if not enabled then return end
     local now = os.clock()
@@ -2192,6 +2268,7 @@ local function farmStep(dt)
     end
     local mobHumanoid, mobRoot = livingNPC(target)
     if target and (not mobHumanoid or not isMagnetized(target, mobHumanoid)) then
+        finishClearedCombatCamp()
         resetTarget("chet / mat muc tieu / het Magnetized (khong xac nhan reward)")
         mobHumanoid, mobRoot = nil, nil
     end
@@ -2257,6 +2334,7 @@ local function farmStep(dt)
         patrol.arrived, patrol.started, patrol.best = nil, nil, math.huge
         patrol.seenAt = nil
         mobHumanoid, mobRoot = livingNPC(target)
+        patrol.combatCamp, patrol.combatHumanoid = combatCampAt(mobRoot.Position), mobHumanoid
         targetSince, lastDamage, lastProgress = now, now, now
         lastHP, bestDistance, attackSince = mobHumanoid.Health, math.huge, nil
         log("FARM", "Chon " .. target.Name)
