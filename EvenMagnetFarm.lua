@@ -1,6 +1,4 @@
--- Event Magnet Farm: standalone client script; uses the game's __ServerBrowser
--- plus HTTP server-list/Worker coordination from the supplied Multi-Account hop.
--- Worker heartbeat sends username, JobId and PlaceId. No downloaded code/hooks.
+-- Event Magnet Farm V1: same-server farming, no server hop or Worker traffic.
 -- Run only one movement/farm script at a time. Stop the other auto scripts first.
 -- Detect replicated events; farm living NPCs whose Name/DisplayName contains
 -- "magnetized" (case insensitive). Generic Magnet tags are diagnostic only.
@@ -17,7 +15,6 @@ local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local Tags = game:GetService("CollectionService")
-local TeleportService = game:GetService("TeleportService")
 local HttpService = game:GetService("HttpService")
 local VirtualInputManager = game:GetService("VirtualInputManager")
 if not game:IsLoaded() then game.Loaded:Wait() end
@@ -54,16 +51,14 @@ local config = {
     FruitPickupAttempts = 3, FruitRetryDelay = 60,
     StoreFruit = true, StoreRetryDelay = 15, StoreAttempts = 3,
     AutoRandomToken = true, WebhookURL = "",
+    WebhookEnabled = true, WebhookOnPickup = true, WebhookOnRandom = true, WebhookOnStore = true,
+    WebhookMinRarity = "Legendary", WebhookUsername = "Noti Fruit", WebhookTitle = "Noti Fruit",
+    WebhookFooterText = "Dev By Gia Yêu Em", WebhookColor = 16776960,
+    WebhookPing = "", WebhookAvatarURL = "", WebhookBannerURL = "",
     AutoCloseSpinner = true, AutoHideItemNotice = true,
     BringMobs = true, BringMobCount = 2, BringMobRadius = 200,
     BringActivationRange = 50, BringPlayerSafeRange = 300, BringMobInterval = 0.1,
-    StartupHop = true, StartupDelay = 5, CurrentPlayerLimit = 4,
-    TargetExistingPlayers = 3, HopMaxPages = 30, HopCandidates = 3,
-    HopRequestRetries = 3, HopRetryDelay = 60, HopTeleportTimeout = 10,
-    HopBrowserTimeout = 8,
-    HopMaxPlayers = 11, HopEmptyPageLimit = 4, HopPageDelay = 0.1,
-    HopMaxAttempts = 8, HopAttemptDelay = 1.5, HopRandomizeTies = true,
-    HopApiUrl = "https://hop.giacode.workers.dev", HopHeartbeatInterval = 30,
+
 }
 local overrides = env.EventMagnetConfig
 -- Seed coordinates copied from auto_farm_level.lua QuestDatabase (not executed).
@@ -310,16 +305,6 @@ config.IslandSpawnTimeout = math.max(config.IslandSpawnTimeout, config.IslandWai
 config.CampSettleTime = math.max(config.CampSettleTime, config.ScanInterval * 2)
 config.FruitPickupAttempts = math.clamp(math.floor(config.FruitPickupAttempts), 1, 10)
 config.StoreAttempts = math.clamp(math.floor(config.StoreAttempts), 1, 10)
-config.CurrentPlayerLimit = math.max(1, math.floor(config.CurrentPlayerLimit))
-config.TargetExistingPlayers = math.clamp(math.floor(config.TargetExistingPlayers),
-    0, math.max(0, config.CurrentPlayerLimit - 1))
-config.HopMaxPages = math.clamp(math.floor(config.HopMaxPages), 1, 30)
-config.HopMaxPlayers = math.clamp(math.floor(config.HopMaxPlayers), 1, 11)
-config.HopMaxAttempts = math.clamp(math.floor(config.HopMaxAttempts), 1, 8)
-config.HopEmptyPageLimit = math.max(1, math.floor(config.HopEmptyPageLimit))
-config.HopHeartbeatInterval = math.max(30, config.HopHeartbeatInterval)
-config.HopCandidates = math.clamp(math.floor(config.HopCandidates), 1, 10)
-config.HopRequestRetries = math.clamp(math.floor(config.HopRequestRetries), 1, 5)
 config.EventDurationSeconds = math.clamp(config.EventDurationSeconds, 1, 3600)
 do
     local wanted = string.lower(tostring(config.Team or "Marines"))
@@ -348,7 +333,6 @@ local closePortalMenu
 local fruitRecords = setmetatable({}, { __mode = "k" })
 local storeRecords = setmetatable({}, { __mode = "k" })
 local fruitTask = { target = nil, started = nil, best = math.huge, progress = 0 }
-local hop = { busy = false, retryAt = 0, status = "Cho kiem tra dau phien" }
 local randomToken = { busy = false, locked = false, retryAt = 0, serial = 0,
     status = "Tu quay khi du 500 token" }
 if type(env.WebhookURL) == "string" then config.WebhookURL = env.WebhookURL end
@@ -375,12 +359,6 @@ local teamSelect = { desired = config.Team, ready = false, pending = false,
     pendingSince = 0, nextAttempt = 0, request = 0, lastResult = "Chua chon team" }
 local sessionSerial = (tonumber(env.__EventMagnetSessionSerial) or 0) + 1
 env.__EventMagnetSessionSerial = sessionSerial
-local serverChoiceMemory = env.__EventMagnetServerChoice
-if type(serverChoiceMemory) ~= "table" then
-    serverChoiceMemory = {}
-    env.__EventMagnetServerChoice = serverChoiceMemory
-end
-
 local function contains(text, word)
     return string.find(string.lower(tostring(text or "")), word, 1, true) ~= nil
 end
@@ -520,15 +498,6 @@ local function cancelAction(reason)
     action.token = action.token + 1
     action.kind = nil
     portal.destination, portal.forCombat = nil, false
-    if oldKind == "hop" then
-        hop.busy = false
-        if hop.dispatched then
-            hop.blocked, hop.dispatched = true, false
-            hop.status = "Da gui teleport; dung hop phien nay vi ket qua chua ro"
-        else
-            hop.status = "Hop tam dung de uu tien farm"
-        end
-    end
     releaseMovement()
 end
 local function hasLiveMagnetized()
@@ -553,7 +522,6 @@ function api.SetEnabled(value)
     if not alive then return end
     enabled = value == true
     cancelAction(enabled and "bat lai" or "da dung")
-    if enabled and not hop.checked then hop.readyAt = nil end
     resetTarget()
     status = enabled and "Dang tim Magnetized..." or "Da dung farm; van theo doi event"
 end
@@ -851,6 +819,105 @@ local function getStoreSummary()
     end
     return owned, blocked, waiting
 end
+-- Webhook format/events/rarity filter adapted from auto_factory.lua.
+-- Only this queue sends HTTP; no Worker, hop API or downloaded code.
+local sendFruitWebhook
+do
+    local fruitInfo, queue = nil, {}
+    local seen = setmetatable({}, {__mode = "k"})
+    local tiers = {common = 1, uncommon = 2, rare = 3, legendary = 4, mythical = 5}
+    local fallback = {
+        kitsune = 5, dragon = 5, leopard = 5, ["t-rex"] = 5, trex = 5,
+        mammoth = 5, dough = 5, shadow = 5, venom = 5, control = 5, spirit = 5, gravity = 5,
+        portal = 4, blizzard = 4, rumble = 4, buddha = 4, sound = 4, phoenix = 4,
+        spider = 4, string = 4, love = 4, pain = 4, paw = 4, quake = 4,
+    }
+    task.spawn(function()
+        local module = RS:WaitForChild("FruitInfo", 5)
+        local ok, data = pcall(function() return module and require(module) end)
+        if alive and env.EventMagnetFarm == api and ok and type(data) == "table" then
+            fruitInfo = data.List
+        end
+    end)
+    local function tierOf(name, storageName)
+        local wanted = fruitIdentity(storageName or name)
+        if type(fruitInfo) == "table" then
+            for key, row in pairs(fruitInfo) do
+                if type(key) == "string" and fruitIdentity(key) == wanted and type(row) == "table" then
+                    local rarity = type(row.Rarity) == "table" and row.Rarity.Name or row.Rarity
+                    if type(rarity) == "string" and tiers[rarity:lower()] then return tiers[rarity:lower()] end
+                end
+            end
+        end
+        return fallback[wanted] or 0
+    end
+    sendFruitWebhook = function(eventType, fruitName, tool, storageName)
+        if not alive or env.EventMagnetFarm ~= api or not config.WebhookEnabled then return end
+        if eventType == "Picked" and not config.WebhookOnPickup
+            or eventType == "Random" and not config.WebhookOnRandom
+            or eventType == "Stored" and not config.WebhookOnStore then return end
+        local url = tostring(env.WebhookURL or ""):match("^%s*(.-)%s*$")
+        if url == "" then url = tostring(config.WebhookURL or ""):match("^%s*(.-)%s*$") end
+        if url == "" then return end
+        if not url:match("^https://") then log("WEBHOOK", "URL phai bat dau bang https://"); return end
+        local minimum = tostring(env.WebhookMinRarity or config.WebhookMinRarity):lower()
+        local threshold = minimum == "all" and 0 or (minimum == "mythical" and 5 or 4)
+        if tierOf(fruitName, storageName) < threshold then return end
+        if tool then
+            seen[tool] = seen[tool] or {}
+            if seen[tool][eventType] then return end
+            seen[tool][eventType] = true
+        end
+        if #queue >= 50 then log("WEBHOOK", "Hang doi day; bo qua thong bao moi"); return end
+        local titles = {Picked = "Picked Fruit", Random = "Random Fruit", Stored = "Stored Fruit"}
+        local embed = {
+            title = config.WebhookTitle, description = "**Main Status**\nUsername : ||" .. player.Name .. "||",
+            color = config.WebhookColor, footer = {text = config.WebhookFooterText},
+            timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+            fields = {
+                {name = titles[eventType] or "Fruit", value = "```\n" .. short(fruitName, 150) .. "\n```", inline = false},
+                {name = "Username", value = "||" .. player.Name .. "||", inline = true},
+                {name = "Time", value = os.date("%Y-%m-%d %H:%M:%S"), inline = true},
+                {name = "PlaceId", value = tostring(game.PlaceId), inline = true},
+            },
+        }
+        if config.WebhookBannerURL:match("^https://") then embed.thumbnail = {url = config.WebhookBannerURL} end
+        local payload = {content = config.WebhookPing, username = config.WebhookUsername, embeds = {embed},
+            allowed_mentions = {parse = {}}}
+        -- Pings are opt-in; never infer @everyone from a fruit notification.
+        if config.WebhookPing == "@everyone" or config.WebhookPing == "@here" then
+            payload.allowed_mentions = {parse = {"everyone"}}
+        end
+        if config.WebhookAvatarURL:match("^https://") then payload.avatar_url = config.WebhookAvatarURL end
+        queue[#queue + 1] = {url = url, payload = payload}
+    end
+    task.spawn(function()
+        while alive and env.EventMagnetFarm == api do
+            task.wait(0.5)
+            if not alive or env.EventMagnetFarm ~= api then break end
+            local entry = table.remove(queue, 1)
+            if entry then
+                local requestFn = (type(request) == "function" and request)
+                    or (type(http_request) == "function" and http_request)
+                    or (type(syn) == "table" and syn.request) or (type(http) == "table" and http.request)
+                    or (type(fluxus) == "table" and fluxus.request)
+                if type(requestFn) ~= "function" then log("WEBHOOK", "Executor khong ho tro HTTP")
+                else
+                    local ok, response = pcall(function()
+                        return requestFn({Url = entry.url, Method = "POST",
+                            Headers = {["Content-Type"] = "application/json"},
+                            Body = HttpService:JSONEncode(entry.payload)})
+                    end)
+                    if alive then
+                        local code = type(response) == "table" and tonumber(response.StatusCode or response.Status or response.status_code)
+                        log("WEBHOOK", ok and code and code >= 200 and code < 300
+                            and "Da gui" or "Gui loi/chua xac nhan; khong tu gui lai")
+                    end
+                end
+            end
+        end
+    end)
+end
 local function startStore(item, force)
     if not config.StoreFruit or action.kind or randomToken.busy then return false end
     local record = storeRecords[item] or { attempts = 0, retryAt = 0, blocked = false }
@@ -897,6 +964,7 @@ local function startStore(item, force)
             record.blocked, record.last = false, "Da luu xac nhan"
             record.retryAt, record.attempts = os.clock() + config.StoreRetryDelay, 0
             log("STORE", short(item.Name, 80) .. ": da luu")
+            sendFruitWebhook("Stored", item.Name, item, storageName)
         else
             -- Ported from auto_factory: a completed call with a remaining Tool
             -- is skipped for this instance; transport failures remain retryable.
@@ -906,7 +974,7 @@ local function startStore(item, force)
             record.last = permanent and "Bo qua trai khong luu duoc (Tool nay)"
                 or (ok and "Chua xac nhan luu" or short(response, 100))
             log("STORE", short(item.Name, 80) .. ": " .. record.last
-                .. (record.blocked and "; chan hop" or "; se thu lai"))
+                .. (record.blocked and "; bo qua Tool nay" or "; se thu lai"))
         end
         endAction("store", token)
     end)
@@ -934,9 +1002,9 @@ end)
 connect(workspace.ChildRemoved, removeFruitRecord)
 refreshFruits()
 
--- Spinner/banner handling ported from auto_factory.lua; only after our rolls.
+-- Same lifecycle as auto_factory: watch while enabled, not just a short roll timer.
 do
-    local spinnerController
+    local spinnerController, lastClose = nil, 0
     task.spawn(function()
         local ok, controller = pcall(function()
             local controllers = RS:WaitForChild("Controllers", 10)
@@ -948,31 +1016,39 @@ do
             spinnerController = controller
         end
     end)
+    local function showing(item)
+        return item and ((item:IsA("ScreenGui") and item.Enabled) or (item:IsA("GuiObject") and item.Visible))
+    end
+    local function hide(item)
+        if item:IsA("ScreenGui") then item.Enabled = false
+        elseif item:IsA("GuiObject") then item.Visible = false end
+    end
     task.spawn(function()
         while alive and env.EventMagnetFarm == api do
             task.wait(0.2)
             if not alive or env.EventMagnetFarm ~= api then break end
-            if enabled and os.clock() < (randomToken.hideUntil or 0) then
+            if enabled then
                 pcall(function()
                     local pg = player:FindFirstChildOfClass("PlayerGui")
                     if not pg then return end
                     local window = pg:FindFirstChild("SpinnerWindow")
-                    if config.AutoCloseSpinner and window and window:IsA("ScreenGui") and window.Enabled then
+                    if config.AutoCloseSpinner and showing(window) then
                         local above = window:FindFirstChild("AboveSpinner")
                         local navigation = above and above:FindFirstChild("Navigation")
                         local close = navigation and navigation:FindFirstChild("CloseButton")
-                        if close and close:IsA("GuiObject") and close.Visible then
+                        if close and close:IsA("GuiObject") and close.Visible and os.clock() - lastClose >= 0.5 then
+                            lastClose = os.clock()
                             local closed = false
                             if spinnerController and type(spinnerController.Close) == "function" then
                                 closed = pcall(function() spinnerController:Close() end)
                             end
-                            if not closed then window.Enabled = false end
+                            if not closed then hide(window) end
                         end
                     end
                     if config.AutoHideItemNotice then
                         for _, name in ipairs({"Item", "ItemUI"}) do
                             local notice = pg:FindFirstChild(name)
-                            if notice and notice:IsA("ScreenGui") then notice.Enabled = false end
+                            if showing(notice) then hide(notice) end
                         end
                     end
                 end)
@@ -1058,18 +1134,6 @@ local sea = ({
     [4442272183] = 2, [79091703265657] = 2,
     [7449423635] = 3, [100117331123089] = 3,
 })[game.PlaceId]
-hop.readyAt = nil
-hop.checked = serverChoiceMemory[game.JobId] == true
-do
-    local ok, chosen = pcall(function() return TeleportService:GetTeleportSetting("EventMagnetChosenServer") end)
-    if ok and type(chosen) == "table" and chosen.id == game.JobId
-        and type(chosen.expires) == "number" and chosen.expires > os.time() then
-        hop.checked = true
-        serverChoiceMemory[game.JobId] = true
-        hop.status = "Da vao server duoc bo hop lua chon"
-    end
-end
-
 local function portalTool()
     local character, backpack = player.Character, player:FindFirstChildOfClass("Backpack")
     return (character and character:FindFirstChild("Portal-Portal"))
@@ -1305,227 +1369,6 @@ local function tryStartPortal(targetPosition, root, humanoid, forCombat)
     return true
 end
 
--- Adapted from the user's Standalone Low Player Server Hop (Multi-Account).
--- All waits belong to this farm session; no second movement/controller loop.
-local hopRandom = Random.new()
-local hopVisited = {}
-do
-    local ok, saved = pcall(function() return TeleportService:GetTeleportSetting("EventMagnetHopTTL") end)
-    if ok and type(saved) == "table" then hopVisited = saved end
-end
-local function loadVisitedServers()
-    local seen = { [game.JobId] = true }
-    for id, expires in pairs(hopVisited) do
-        if type(expires) == "number" and expires > os.time() then seen[id] = true
-        else hopVisited[id] = nil end
-    end
-    return seen
-end
-local function saveVisitedServer(id)
-    hopVisited[id] = os.time() + 90
-    pcall(function() TeleportService:SetTeleportSetting("EventMagnetHopTTL", hopVisited) end)
-end
-local function hopAllowed(token)
-    local character = player.Character
-    if not character or not character:FindFirstChild("HasBuso") then return false end
-    return actionIsCurrent("hop", token) and not eventWindow.active
-        and not hasLiveMagnetized() and #ownedFruitTools() == 0 and not randomToken.busy
-end
-local function hopRequest(options)
-    local requestFn = (type(http_request) == "function" and http_request)
-        or (type(request) == "function" and request)
-        or (type(syn) == "table" and syn.request)
-        or (type(http) == "table" and http.request)
-        or (type(fluxus) == "table" and fluxus.request)
-    if type(requestFn) ~= "function" then return nil end
-    options.url, options.method = options.Url, options.Method or "GET"
-    options.headers, options.body = options.Headers, options.Body
-    return requestFn(options)
-end
-local function hopCall(token, callback)
-    local done, ok, value = false, false, nil
-    task.spawn(function()
-        if hopAllowed(token) then ok, value = pcall(callback) end
-        done = true
-    end)
-    local deadline = os.clock() + config.HopBrowserTimeout
-    while not done and hopAllowed(token) and os.clock() < deadline do task.wait(0.1) end
-    if not done then
-        -- A yielded request cannot be revoked; don't accumulate more requests.
-        hop.blocked = true
-        return false, "Request timeout/da huy; dung hop phien nay"
-    end
-    return ok, value
-end
-local function workerRequest(path, payload)
-    if config.HopApiUrl == "" then return nil end
-    return hopRequest({
-        Url = config.HopApiUrl:gsub("/+$", "") .. path,
-        Method = payload and "POST" or "GET",
-        Headers = { ["Content-Type"] = "application/json" },
-        Body = payload and HttpService:JSONEncode(payload) or nil,
-    })
-end
-local function fetchOccupiedServers(token)
-    local occupied = loadVisitedServers()
-    if config.HopApiUrl == "" then return occupied end
-    local ok, response = hopCall(token, function() return workerRequest("/api/occupied") end)
-    if ok and type(response) == "table" and tonumber(response.StatusCode) == 200 then
-        local decoded, data = pcall(function() return HttpService:JSONDecode(response.Body) end)
-        if decoded and type(data) == "table" and type(data.occupied) == "table" then
-            for _, id in ipairs(data.occupied) do occupied[tostring(id)] = true end
-        end
-    end
-    return occupied
-end
-local function chooseHopCandidate(candidates)
-    if #candidates == 0 then return nil end
-    local best, ties = math.huge, {}
-    for _, candidate in ipairs(candidates) do
-        if candidate.playing < best then best, ties = candidate.playing, { candidate }
-        elseif candidate.playing == best then table.insert(ties, candidate) end
-    end
-    return ties[config.HopRandomizeTies and hopRandom:NextInteger(1, #ties) or 1]
-end
-local function findHopCandidates(token, occupied)
-    local browser = RS:FindFirstChild("__ServerBrowser")
-    if browser and not browser:IsA("RemoteFunction") then browser = nil end
-    local candidates, added, empty = {}, {}, 0
-    local function add(id, count, maximum)
-        if type(id) == "string" and id ~= "" and count and count >= 0
-            and count <= config.HopMaxPlayers and count < maximum
-            and not occupied[id] and not added[id] then
-            added[id] = true
-            table.insert(candidates, { id = id, playing = count, browser = browser })
-        end
-    end
-    if browser then
-        for page = 1, config.HopMaxPages do
-            if not hopAllowed(token) or hop.blocked then return nil end
-            hop.status = "Quet ServerBrowser trang " .. page
-            local ok, servers = hopCall(token, function() return browser:InvokeServer(page) end)
-            if hop.blocked then return nil end
-            if not ok or type(servers) ~= "table" or next(servers) == nil then empty = empty + 1
-            else
-                empty = 0
-                for id, info in pairs(servers) do
-                    if type(info) == "table" then add(id, tonumber(info.Count), 12) end
-                end
-            end
-            local best = chooseHopCandidate(candidates)
-            if (best and best.playing <= config.TargetExistingPlayers) or empty >= config.HopEmptyPageLimit then break end
-            task.wait(config.HopPageDelay)
-        end
-    end
-    local best = chooseHopCandidate(candidates)
-    if best then return best end
-    -- User script's Roblox public-server API fallback, always the current PlaceId.
-    local cursor = ""
-    for page = 1, 4 do
-        if not hopAllowed(token) or hop.blocked then return nil end
-        hop.status = "Quet Roblox API trang " .. page
-        local url = string.format("https://games.roblox.com/v1/games/%s/servers/Public?sortOrder=Asc&limit=100", tostring(game.PlaceId))
-        if cursor ~= "" then url = url .. "&cursor=" .. HttpService:UrlEncode(cursor) end
-        local ok, response = hopCall(token, function() return hopRequest({ Url = url, Method = "GET" }) end)
-        if not ok or type(response) ~= "table" or tonumber(response.StatusCode) ~= 200 then break end
-        local decoded, data = pcall(function() return HttpService:JSONDecode(response.Body) end)
-        if not decoded or type(data) ~= "table" or type(data.data) ~= "table" then break end
-        for _, info in ipairs(data.data) do
-            if type(info) == "table" then add(info.id, tonumber(info.playing), tonumber(info.maxPlayers) or 12) end
-        end
-        best = chooseHopCandidate(candidates)
-        if best and best.playing <= config.TargetExistingPlayers then break end
-        cursor = type(data.nextPageCursor) == "string" and data.nextPageCursor or ""
-        if cursor == "" then break end
-        task.wait(0.2)
-    end
-    return chooseHopCandidate(candidates)
-end
-local function requestHopTeleport(token, candidate)
-    if config.HopApiUrl ~= "" then
-        hopCall(token, function() return workerRequest("/api/reserve", { jobId = candidate.id }) end)
-    end
-    if not hopAllowed(token) or hop.blocked then return "cancelled" end
-    saveVisitedServer(candidate.id)
-    -- Accept our chosen fallback server after re-execute, avoiding a hop chain.
-    pcall(function()
-        TeleportService:SetTeleportSetting("EventMagnetChosenServer", {
-            id = candidate.id, expires = os.time() + 120,
-        })
-    end)
-    hop.status = "Dang vao server " .. candidate.playing .. " nguoi"
-    local failed, started, done, failureMessage = false, false, false, nil
-    local failedConnection = TeleportService.TeleportInitFailed:Connect(function(who, result, message)
-        if who == player then failed, failureMessage = true, tostring(result) .. ": " .. tostring(message) end
-    end)
-    local stateConnection = player.OnTeleport:Connect(function(state)
-        if state == Enum.TeleportState.Started or state == Enum.TeleportState.InProgress then started = true end
-        if state == Enum.TeleportState.Failed then failed, failureMessage = true, failureMessage or "Teleport failed" end
-    end)
-    hop.dispatched = true
-    task.spawn(function()
-        if not hopAllowed(token) then done, failed = true, true; return end
-        local ok, err = false, nil
-        if candidate.browser then
-            ok, err = pcall(function() candidate.browser:InvokeServer("teleport", candidate.id) end)
-        end
-        -- Match supplied fallback only on a thrown call error or missing browser;
-        -- never send a second route after Started or an explicit restriction.
-        if not ok and not started and not failed and hopAllowed(token) then
-            ok, err = pcall(function() TeleportService:TeleportToPlaceInstance(game.PlaceId, candidate.id, player) end)
-        end
-        if not ok then failed, failureMessage = true, tostring(err) end
-        done = true
-    end)
-    local deadline = os.clock() + config.HopTeleportTimeout
-    while actionIsCurrent("hop", token) and not failed and os.clock() < deadline do task.wait(0.2) end
-    if failed and actionIsCurrent("hop", token) then task.wait(0.3) end
-    failedConnection:Disconnect(); stateConnection:Disconnect()
-    hop.dispatched = false
-    if not actionIsCurrent("hop", token) then return "cancelled" end
-    if started and not failed or not done then
-        hop.blocked = true
-        hop.status = "Teleport chua ro ket qua; dung hop phien nay"
-        return "pending"
-    end
-    -- A completed request with no departure can retry as in the supplied script.
-    hop.status = failureMessage or "Van o server cu sau timeout; thu server khac"
-    log("HOP", hop.status)
-    return "retry"
-end
-local function startHop()
-    if hop.busy or hop.checked or hop.blocked or action.kind or randomToken.busy or eventWindow.active then return false end
-    local token = beginAction("hop")
-    if not token then return false end
-    hop.busy, hop.status = true, "Dang tim server it nguoi"
-    releaseMovement()
-    task.spawn(function()
-        local ok, err = pcall(function()
-            for attempt = 1, config.HopMaxAttempts do
-                if not hopAllowed(token) or hop.blocked then break end
-                hop.status = "Quet server lan " .. attempt .. "/" .. config.HopMaxAttempts
-                local occupied = fetchOccupiedServers(token)
-                if not hopAllowed(token) or hop.blocked then break end
-                local candidate = findHopCandidates(token, occupied)
-                if candidate and hopAllowed(token) and not hop.blocked then
-                    local outcome = requestHopTeleport(token, candidate)
-                    if outcome ~= "retry" then break end
-                end
-                local deadline = os.clock() + config.HopAttemptDelay
-                while hopAllowed(token) and os.clock() < deadline do task.wait(0.1) end
-            end
-        end)
-        if actionIsCurrent("hop", token) then
-            hop.busy, hop.retryAt = false, os.clock() + config.HopRetryDelay
-            if not ok then hop.status = "Hop loi: " .. short(err, 100)
-            elseif not hop.blocked then hop.status = "Het luot quet; cho thu lai" end
-            log("HOP", hop.status)
-            endAction("hop", token)
-        end
-    end)
-    return true
-end
-
 local islandMode = sea == 1 and config.Sea1IslandMode and config.Patrol
 -- Explicit groups: a completed island cannot be re-added by a new spawn marker.
 -- Sky regions at different elevations are separate stops to allow streaming.
@@ -1651,11 +1494,11 @@ function api.GetState()
     return {
         alive = alive, enabled = enabled, sea = sea, action = action.kind,
         eventActive = eventWindow.active, eventRemaining = eventWindow.remaining,
-        hopBlocked = hop.blocked == true,
+        hopBlocked = false,
         status = status, magnetized = #targets, worldFruits = #api.GetFruits(),
         ownedFruits = #owned, blockedFruits = blocked, waitingStore = waiting,
         portal = portal.lastResult, portalDestination = portal.destination,
-        hopChecked = hop.checked, hopBusy = hop.busy, hopStatus = hop.status,
+        hopChecked = true, hopBusy = false, hopStatus = "Da loai hop o V1",
         playerCount = #Players:GetPlayers(), session = sessionSerial,
     }
 end
@@ -1926,6 +1769,7 @@ local function startFruitPickup(record, root, humanoid)
             failFruit(record, "Khong kich hoat duoc touch")
         elseif found then
             log("FRUIT", "Da xac nhan nhat: " .. short(found.Name, 80))
+            sendFruitWebhook("Picked", found.Name, found, getFruitOriginalName(found))
             fruitTask.target, fruitTask.started = nil, nil
         else
             failFruit(record, "Da cham nhung chua vao inventory")
@@ -2024,7 +1868,6 @@ local function randomTokenStep()
             local before = {}
             for _, item in ipairs(ownedFruitTools()) do before[item] = true end
             dispatched = true
-            randomToken.hideUntil = os.clock() + 15
             randomToken.status = "Quay 500 Magnet Token"
             local accepted, details = rf:InvokeServer({Context = "Purchase", BoxName = "MagnetEventGacha26"})
             if not current() then return end
@@ -2035,41 +1878,24 @@ local function randomTokenStep()
                 randomToken.locked, randomToken.status = true, "Purchase chua ro; dung random"
                 return
             end
-            task.wait(2)
-            if not current() then return end
-            randomToken.hideUntil = os.clock() + 10
             local rewards = {}
-            for _, item in ipairs(ownedFruitTools()) do
-                if not before[item] then rewards[#rewards + 1] = item.Name end
-            end
+            -- auto_factory waits for a real reward Tool; don't invent a fruit from Purchase=true.
+            local rewardDeadline = os.clock() + 8
+            repeat
+                task.wait(0.1)
+                if not current() then return end
+                rewards = {}
+                for _, item in ipairs(ownedFruitTools()) do
+                    if not before[item] then rewards[#rewards + 1] = item.Name end
+                end
+            until #rewards > 0 or os.clock() >= rewardDeadline
             randomToken.status = #rewards > 0 and ("Nhan " .. table.concat(rewards, ", "))
                 or "Server chap nhan; chua thay Fruit"
             log("RANDOM", randomToken.status)
-            local url, message = config.WebhookURL, randomToken.status
-            if type(url) == "string" and url:match("^https://") then
-                task.spawn(function()
-                    if not alive then return end
-                    local sent, response = pcall(function()
-                        return hopRequest({Url = url, Method = "POST",
-                            Headers = {["Content-Type"] = "application/json"},
-                            Body = HttpService:JSONEncode({username = "Magnet Farm",
-                                allowed_mentions = {parse = {}}, embeds = {{
-                                    title = "Magnet Token Random", description = message,
-                                    fields = {{name = "Player", value = player.Name},
-                                        {name = "PlaceId", value = tostring(game.PlaceId)},
-                                        {name = "Token truoc quay", value = tostring(price.Current)}},
-                                    footer = {text = "Dev By Gia Yêu Em"},
-                                    timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
-                                }}})})
-                    end)
-                    if alive and (not sent or type(response) ~= "table"
-                        or (tonumber(response.StatusCode) or 0) < 200
-                        or (tonumber(response.StatusCode) or 0) >= 300) then
-                        log("WEBHOOK", "Gui that bai; khong tu gui lai")
-                    end
-                end)
+            for _, item in ipairs(ownedFruitTools()) do
+                if not before[item] then sendFruitWebhook("Random", item.Name, item, getFruitOriginalName(item)) end
             end
-            randomToken.retryAt = os.clock() + 3
+            randomToken.retryAt = os.clock() + (#rewards > 0 and 3 or 30)
         end)
         if not current() then return end
         if not ok then
@@ -2142,11 +1968,27 @@ local function restoreSeatGuard()
     end
     seatGuard.humanoid, seatGuard.original = nil, nil
 end
+local function needsMovement()
+    if not alive or not enabled then return false end
+    local character = player.Character
+    local root = rootOf(character)
+    if not root or not character:FindFirstChild("HasBuso") or not teamSelect.ready then return false end
+    if action.kind == "portal" or action.kind == "pickup" then return true end
+    if hasLiveMagnetized() then return true end
+    if action.kind == "store" then return false end
+    if config.Patrol and (not config.EventScheduleEnabled or eventWindow.active) and #patrol.points > 0 then return true end
+    if config.FruitEnabled and not eventWindow.active then
+        local owned, blocked = getStoreSummary()
+        return #owned == blocked and nearestFruit(root, os.clock()) ~= nil
+    end
+    return false
+end
 local function updateSeatGuard()
     local character = player.Character
     local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-    if seatGuard.humanoid ~= humanoid or not enabled or not alive then restoreSeatGuard() end
-    if not alive or not enabled or not humanoid or humanoid.Health <= 0 then return end
+    local moving = needsMovement()
+    if seatGuard.humanoid ~= humanoid or not moving then restoreSeatGuard() end
+    if not moving or not humanoid or humanoid.Health <= 0 then return end
     if not seatGuard.humanoid then
         seatGuard.original = humanoid:GetStateEnabled(Enum.HumanoidStateType.Seated)
         seatGuard.humanoid = humanoid
@@ -2158,6 +2000,11 @@ local function recoverFromSeat(root, humanoid, now)
     if seatRecovery.root ~= root then
         seatRecovery.root, seatRecovery.nextAttempt, seatRecovery.pending = root, 0, false
         seatRecovery.started, seatRecovery.clearSince = nil, nil
+    end
+    if not needsMovement() then
+        restoreSeatGuard()
+        seatRecovery.pending, seatRecovery.started, seatRecovery.clearSince = false, nil, nil
+        return false
     end
     if humanoid.Sit or humanoid.SeatPart then
         releaseMovement()
@@ -2242,26 +2089,21 @@ local function farmStep(dt)
     end
     if not character:FindFirstChild("HasBuso") then
         releaseMovement()
-        if action.kind and not hop.dispatched then cancelAction("cho Haki bat buoc") end
+        if action.kind then cancelAction("cho Haki bat buoc") end
         status = "Cho bat Haki Buso bat buoc; chua xac nhan HasBuso"
         return
     end
-    hop.readyAt = hop.readyAt or (now + config.StartupDelay)
     if recoverFromSeat(root, humanoid, now) then return end
-    if eventWindow.active and action.kind == "hop" and not hop.dispatched then
-        cancelAction("den gio event; uu tien tuan tra")
-    end
     if config.EventScheduleEnabled and not eventWindow.active and action.kind == "portal"
         and not portal.forCombat and not fruitTask.target then
         cancelAction("het gio event; dung Portal tuan tra")
     end
-    if hasLiveMagnetized() and action.kind and not hop.dispatched
+    if hasLiveMagnetized() and action.kind
         and not (action.kind == "portal" and portal.forCombat) then
         cancelAction("nhuong Magnetized")
     end
     if action.kind then
         status = action.kind == "portal" and ("Dang mo Portal: " .. tostring(portal.destination))
-            or action.kind == "hop" and hop.status
             or action.kind == "store" and "Dang xac nhan luu Fruit"
             or "Dang xac nhan nhat Fruit"
         return
@@ -2298,30 +2140,10 @@ local function farmStep(dt)
                 end
             end
 
-            if not config.StartupHop then
-                hop.checked, hop.status = true, "Hop dau phien dang tat"
-            elseif not hop.checked and not hop.blocked and not eventWindow.active then
-                if now < hop.readyAt then
-                    status = "Cho on dinh dau phien " .. math.ceil(hop.readyAt - now) .. "s"
-                    return
-                elseif #Players:GetPlayers() <= config.CurrentPlayerLimit then
-                    hop.checked, hop.status = true, "Da o server <= " .. config.CurrentPlayerLimit .. " nguoi"
-                    serverChoiceMemory[game.JobId] = true
-                    log("HOP", hop.status)
-                elseif #owned > 0 then
-                    hop.status = "Chan hop: con " .. #owned .. " Fruit chua luu"
-                    status = hop.status .. (blocked > 0 and " (can RetryStore sau khi xu ly kho)" or "")
-                elseif now >= hop.retryAt and startHop() then
-                    status = hop.status
-                    return
-                end
-            end
-
             -- Rejected Tools stay in the bag but must not block the next pickup.
-            -- A new/unresolved Tool still waits for its store attempt. Holding a
-            -- rejected Tool also prevents hop, so allow pickup before hop.checked.
+            -- Only a new/unresolved Tool waits for its store attempt.
             local pendingStore = #owned - blocked
-            if pendingStore == 0 and (hop.checked or hop.blocked or blocked > 0)
+            if pendingStore == 0
                 and not eventWindow.active and fruitStep(root, humanoid, dt, now) then return end
             if config.EventScheduleEnabled and not eventWindow.active then
                 releaseMovement()
@@ -2476,221 +2298,185 @@ if not mounted then
     error("Khong the hien EventMagnetFarmUI qua gethui/CoreGui/PlayerGui")
 end
 local UIS = game:GetService("UserInputService")
-
--- Compact Dashboard V2: UI-only replacement. Farm/event/patrol/portal/hop logic stays unchanged.
 local C = {
-    bg = Color3.fromRGB(7, 16, 28),
-    card = Color3.fromRGB(10, 25, 40),
-    card2 = Color3.fromRGB(11, 29, 46),
-    border = Color3.fromRGB(0, 160, 255),
-    borderSoft = Color3.fromRGB(18, 112, 180),
-    text = Color3.fromRGB(232, 242, 255),
-    muted = Color3.fromRGB(145, 184, 220),
-    cyan = Color3.fromRGB(38, 181, 255),
-    green = Color3.fromRGB(50, 244, 128),
-    yellow = Color3.fromRGB(255, 191, 46),
-    red = Color3.fromRGB(225, 43, 72),
-    button = Color3.fromRGB(24, 50, 79),
+    bg = Color3.fromRGB(3, 20, 35), card = Color3.fromRGB(4, 28, 47),
+    cyan = Color3.fromRGB(0, 218, 255), line = Color3.fromRGB(12, 89, 125),
+    text = Color3.fromRGB(228, 243, 255), muted = Color3.fromRGB(142, 188, 224),
+    green = Color3.fromRGB(0, 241, 130), yellow = Color3.fromRGB(255, 207, 0),
+    red = Color3.fromRGB(225, 15, 62), button = Color3.fromRGB(5, 43, 81),
 }
-
 local panel = Instance.new("Frame")
-panel.Name = "CompactDashboard"
-panel.Size = UDim2.fromOffset(420, 474)
-panel.Position = UDim2.new(0, 12, 0.5, -237)
-panel.BackgroundColor3 = C.bg
-panel.BorderSizePixel = 0
-panel.ClipsDescendants = true
-panel.Active = true
-panel.Parent = gui
-
-local panelCorner = Instance.new("UICorner")
-panelCorner.CornerRadius = UDim.new(0, 12)
-panelCorner.Parent = panel
-local panelStroke = Instance.new("UIStroke")
-panelStroke.Color = C.border
-panelStroke.Thickness = 1.5
-panelStroke.Transparency = 0.05
-panelStroke.Parent = panel
-
-local function corner(parent, radius)
-    local c = Instance.new("UICorner")
-    c.CornerRadius = UDim.new(0, radius or 8)
-    c.Parent = parent
-    return c
+panel.Name, panel.Size = "MagnetDashboard", UDim2.fromOffset(560, 680)
+panel.AnchorPoint, panel.Position = Vector2.new(0.5, 0.5), UDim2.fromScale(0.5, 0.5)
+panel.BackgroundColor3, panel.BorderSizePixel = C.bg, 0
+panel.Active, panel.ClipsDescendants, panel.Parent = true, true, gui
+local scale = Instance.new("UIScale")
+scale.Parent = panel
+local function rounded(parent, radius, color, thickness)
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius, corner.Parent = UDim.new(0, radius), parent
+    if color then
+        local outline = Instance.new("UIStroke")
+        outline.Color, outline.Thickness, outline.Parent = color, thickness or 1, parent
+    end
 end
-
-local function stroke(parent, color, thickness, transparency)
-    local s = Instance.new("UIStroke")
-    s.Color = color or C.borderSoft
-    s.Thickness = thickness or 1
-    s.Transparency = transparency or 0
-    s.Parent = parent
-    return s
+rounded(panel, 16, C.cyan, 2)
+local function text(parent, value, x, y, w, h, size, color, bold)
+    local label = Instance.new("TextLabel")
+    label.Position, label.Size = UDim2.fromOffset(x, y), UDim2.fromOffset(w, h)
+    label.Text, label.TextSize = value, size or 16
+    label.TextColor3, label.BackgroundTransparency = color or C.text, 1
+    label.Font = bold and Enum.Font.GothamBold or Enum.Font.Gotham
+    label.TextWrapped, label.TextXAlignment = true, Enum.TextXAlignment.Left
+    label.Parent = parent
+    return label
 end
-
-local function text(parent, value, x, y, w, h, size, color, bold, xAlign, yAlign)
-    local t = Instance.new("TextLabel")
-    t.BackgroundTransparency = 1
-    t.Position = UDim2.fromOffset(x, y)
-    t.Size = UDim2.fromOffset(w, h)
-    t.Text = value or ""
-    t.TextColor3 = color or C.text
-    t.TextSize = size or 12
-    t.Font = bold and Enum.Font.GothamBold or Enum.Font.Gotham
-    t.TextXAlignment = xAlign or Enum.TextXAlignment.Left
-    t.TextYAlignment = yAlign or Enum.TextYAlignment.Center
-    t.TextWrapped = true
-    t.BorderSizePixel = 0
-    t.Parent = parent
-    return t
+local function card(parent, x, y, w, h)
+    local frame = Instance.new("Frame")
+    frame.Position, frame.Size = UDim2.fromOffset(x, y), UDim2.fromOffset(w, h)
+    frame.BackgroundColor3, frame.BorderSizePixel, frame.Parent = C.card, 0, parent
+    rounded(frame, 10, C.line, 1)
+    return frame
 end
-
-local function card(x, y, w, h)
-    local f = Instance.new("Frame")
-    f.Position = UDim2.fromOffset(x, y)
-    f.Size = UDim2.fromOffset(w, h)
-    f.BackgroundColor3 = C.card
-    f.BorderSizePixel = 0
-    f.Parent = panel
-    corner(f, 8)
-    stroke(f, C.borderSoft, 1, 0.08)
-    return f
+local function button(parent, label, x, y, w, h, color)
+    local item = Instance.new("TextButton")
+    item.Position, item.Size = UDim2.fromOffset(x, y), UDim2.fromOffset(w, h)
+    item.Text, item.Font, item.TextSize = label, Enum.Font.GothamBold, 18
+    item.BackgroundColor3, item.TextColor3 = color or C.button, C.text
+    item.BorderSizePixel, item.Parent = 0, parent
+    rounded(item, 9, C.cyan, 1)
+    return item
 end
-
-local function infoCard(x, y, titleText)
-    local f = card(x, y, 194, 48)
-    text(f, titleText, 10, 5, 174, 13, 9, C.muted, true)
-    local value = text(f, "-", 10, 20, 174, 22, 14, C.text, true)
+local header = Instance.new("Frame")
+header.Name, header.Size, header.BackgroundTransparency = "DragHandle", UDim2.new(1, 0, 0, 54), 1
+header.Active, header.Parent = true, panel
+local titleLabel = text(header, "MAGNETIZED FARM", 20, 9, 370, 34, 24, C.text, true)
+local onLabel = text(header, "● ON", 405, 10, 68, 32, 20, C.green, true)
+local minimize = button(header, "−", 476, 10, 32, 32)
+local topClose = button(header, "×", 516, 10, 32, 32)
+local body = Instance.new("Frame")
+body.Name, body.Size, body.BackgroundTransparency = "DashboardBody", UDim2.fromScale(1, 1), 1
+body.Parent = panel
+-- Keep header above the transparent body so drag/minimize/close remain clickable.
+header.ZIndex = 3
+for _, child in ipairs(header:GetChildren()) do if child:IsA("GuiObject") then child.ZIndex = 4 end end
+local refs = {}
+text(body, "●  USER", 22, 64, 102, 25, 15, C.muted, true)
+text(body, "@" .. player.Name, 128, 62, 406, 29, 19, C.text, true)
+local teamCard = card(body, 18, 108, 169, 76)
+text(teamCard, "♟ TEAM", 12, 8, 145, 20, 13, C.muted, true)
+refs.team = text(teamCard, "-", 12, 31, 145, 34, 20, C.text, true)
+local eventCard = card(body, 195, 108, 169, 76)
+text(eventCard, "◷ EVENT", 12, 8, 145, 20, 13, C.muted, true)
+refs.event = text(eventCard, "-", 12, 31, 145, 34, 16, C.yellow, true)
+local campCard = card(body, 372, 108, 170, 76)
+text(campCard, "⌖ VÒNG / BÃI", 12, 8, 146, 20, 13, C.muted, true)
+refs.camp = text(campCard, "-", 12, 31, 146, 34, 21, C.text, true)
+local counts = card(body, 18, 196, 524, 112)
+local function counter(label, x, y)
+    text(counts, label, x, y, 136, 25, 16, C.muted, false)
+    local value = text(counts, "0", x + 138, y, 90, 25, 17, C.text, true)
+    value.TextXAlignment = Enum.TextXAlignment.Right
     return value
 end
-
--- Header / drag handle.
-local header = Instance.new("Frame")
-header.Name = "DragHandle"
-header.Size = UDim2.new(1, 0, 0, 46)
-header.BackgroundTransparency = 1
-header.Active = true
-header.Parent = panel
-
-local titleLabel = text(header, "MAGNETIZED FARM", 14, 3, 270, 23, 14, C.text, true)
-text(header, "Dev By Gia Yêu Em", 14, 26, 270, 15, 11, C.muted, false)
-local onDot = text(header, "●", 292, 7, 18, 30, 14, C.green, true, Enum.TextXAlignment.Center)
-local onLabel = text(header, "ON", 309, 7, 34, 30, 12, C.green, true, Enum.TextXAlignment.Left)
-text(header, "—", 349, 6, 24, 30, 16, C.muted, false, Enum.TextXAlignment.Center)
-
-local topClose = Instance.new("TextButton")
-topClose.Name = "TopClose"
-topClose.Position = UDim2.fromOffset(379, 6)
-topClose.Size = UDim2.fromOffset(29, 30)
-topClose.BackgroundTransparency = 1
-topClose.Text = "×"
-topClose.TextColor3 = C.text
-topClose.TextSize = 24
-topClose.Font = Enum.Font.Gotham
-topClose.Parent = header
-
-local divider = Instance.new("Frame")
-divider.Position = UDim2.fromOffset(12, 44)
-divider.Size = UDim2.new(1, -24, 0, 1)
-divider.BackgroundColor3 = C.borderSoft
-divider.BorderSizePixel = 0
-divider.Parent = panel
-
-local teamValue = infoCard(12, 54, "TEAM")
-local eventTimeValue = infoCard(214, 54, "EVENT")
-eventTimeValue.TextColor3 = C.yellow
-local roundValue = infoCard(12, 110, "VÒNG")
-roundValue.TextColor3 = C.yellow
-local areaValue = infoCard(214, 110, islandMode and "ĐẢO" or "BÃI")
-areaValue.TextColor3 = C.yellow
-
--- Counters.
-local counterCard = card(12, 166, 396, 92)
-local counterDivider = Instance.new("Frame")
-counterDivider.Position = UDim2.fromOffset(198, 10)
-counterDivider.Size = UDim2.fromOffset(1, 72)
-counterDivider.BackgroundColor3 = C.borderSoft
-counterDivider.BorderSizePixel = 0
-counterDivider.Parent = counterCard
-
-local function counterRow(parent, x, y, labelText, valueColor)
-    text(parent, labelText, x, y, 96, 22, 12, C.text, false)
-    return text(parent, "0", x + 98, y, 66, 22, 13, valueColor or C.green, true, Enum.TextXAlignment.Right)
+refs.magnet = counter("Magnetized", 14, 10)
+refs.owned = counter("Giữ", 14, 43)
+refs.auto = counter("Auto token", 14, 76)
+refs.events = counter("Event", 280, 10)
+refs.fruits = counter("Fruit map", 280, 43)
+refs.blocked = counter("Chờ/chặn", 280, 76)
+local system = card(body, 18, 320, 524, 112)
+text(system, "⚙  HỆ THỐNG", 14, 8, 490, 26, 17, C.muted, true)
+text(system, "Portal", 14, 42, 110, 26, 16, C.muted)
+refs.portal = text(system, "-", 130, 40, 380, 32, 15)
+text(system, "Webhook", 14, 78, 110, 26, 16, C.muted)
+refs.webhook = text(system, "-", 130, 76, 380, 28, 15)
+local stateCard = card(body, 18, 444, 524, 112)
+text(stateCard, "⌁  TRẠNG THÁI", 14, 6, 490, 25, 17, C.cyan, true)
+local targetLabel = text(stateCard, "Đang khởi động...", 14, 34, 496, 40, 17, C.cyan, true)
+refs.random = text(stateCard, "-", 14, 77, 496, 25, 12, C.muted)
+local toggle = button(body, "■  DỪNG FARM", 18, 568, 256, 52, C.red)
+local close = button(body, "⇥  THOÁT", 286, 568, 256, 52, C.button)
+local footer = text(body, "Dev By Gia Yêu Em", 18, 637, 524, 27, 20, C.cyan)
+footer.TextXAlignment = Enum.TextXAlignment.Center
+local collapsed, dragging, dragInput, dragStart, startPosition = false, false, nil, nil, nil
+local cameraConnection
+local function viewport()
+    return workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(1280, 720)
 end
-local magnetizedValue = counterRow(counterCard, 16, 7, "Magnetized", C.green)
-local ownedValue = counterRow(counterCard, 16, 34, "Giữ", C.green)
-local randomValue = text(counterCard, "Auto token: ON", 16, 61, 175, 26, 10, C.cyan, false)
-local eventCountValue = counterRow(counterCard, 210, 7, "Event", C.yellow)
-local fruitMapValue = counterRow(counterCard, 210, 34, "Fruit map", C.yellow)
-local waitBlockValue = counterRow(counterCard, 210, 61, "Chờ/chặn", C.yellow)
-
--- Portal / hop summary.
-local systemCard = card(12, 266, 396, 58)
-text(systemCard, "Portal", 14, 5, 55, 22, 11, C.muted, false)
-text(systemCard, ":", 70, 5, 10, 22, 11, C.muted, false)
-local portalValue = text(systemCard, "Chưa dùng", 84, 5, 294, 22, 11, C.green, true)
-text(systemCard, "Hop", 14, 30, 55, 22, 11, C.muted, false)
-text(systemCard, ":", 70, 30, 10, 22, 11, C.muted, false)
-local hopValue = text(systemCard, "Chờ kiểm tra đầu phiên", 84, 30, 294, 22, 11, C.green, true)
-
--- Logs remain available through GetLogs(), but are not displayed on the UI.
-local targetCard = card(12, 332, 396, 88)
-text(targetCard, "TRẠNG THÁI", 12, 5, 372, 18, 10, C.cyan, true)
-local targetLabel = text(targetCard, "-", 12, 25, 372, 56, 11, C.text, false, Enum.TextXAlignment.Left, Enum.TextYAlignment.Top)
-
-local function button(parent, labelText, x, w, color)
-    local b = Instance.new("TextButton")
-    b.Position = UDim2.fromOffset(x, 428)
-    b.Size = UDim2.fromOffset(w, 34)
-    b.BackgroundColor3 = color
-    b.BorderSizePixel = 0
-    b.Text = labelText
-    b.TextColor3 = Color3.new(1, 1, 1)
-    b.TextSize = 12
-    b.Font = Enum.Font.GothamBold
-    b.AutoButtonColor = true
-    b.Parent = parent
-    corner(b, 8)
-    stroke(b, color == C.red and Color3.fromRGB(255, 72, 100) or C.borderSoft, 1, 0.05)
-    return b
+local function fitPanel()
+    local size = viewport()
+    if size.X < 40 or size.Y < 40 then return end
+    -- Same scale in expanded/collapsed states prevents position jumps on reopening.
+    scale.Scale = math.min(1, (size.X - 24) / 560, (size.Y - 24) / 680)
+    local half = Vector2.new(560, collapsed and 54 or 680) * scale.Scale / 2
+    local x = panel.Position.X.Scale * size.X + panel.Position.X.Offset
+    local y = panel.Position.Y.Scale * size.Y + panel.Position.Y.Offset
+    panel.Position = UDim2.fromOffset(
+        math.clamp(x, half.X + 8, size.X - half.X - 8),
+        math.clamp(y, half.Y + 8, size.Y - half.Y - 8))
 end
-
-local toggle = button(panel, "DỪNG FARM", 12, 244, C.red)
-local close = button(panel, "THOÁT", 264, 144, C.button)
-
--- Dragging uses input events only; no extra Heartbeat and no farm logic changes.
-local dragging = false
-local dragInput, dragStart, startPos
-connect(header.InputBegan, function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1
-        or input.UserInputType == Enum.UserInputType.Touch then
-        dragging = true
-        dragStart = input.Position
-        startPos = panel.Position
-    end
+connect(minimize.Activated, function()
+    collapsed = not collapsed
+    body.Visible = not collapsed
+    panel.Size = UDim2.fromOffset(560, collapsed and 54 or 680)
+    minimize.Text = collapsed and "+" or "−"
+    titleLabel.Text = collapsed and ("MAGNETIZED FARM | @" .. player.Name) or "MAGNETIZED FARM"
+    titleLabel.TextSize = collapsed and 15 or 24
+    fitPanel()
 end)
-connect(header.InputChanged, function(input)
-    if input.UserInputType == Enum.UserInputType.MouseMovement
-        or input.UserInputType == Enum.UserInputType.Touch then
-        dragInput = input
-    end
+local function bindCamera()
+    if cameraConnection then cameraConnection:Disconnect() end
+    local camera = workspace.CurrentCamera
+    if camera then cameraConnection = connect(camera:GetPropertyChangedSignal("ViewportSize"), fitPanel) end
+    fitPanel()
+end
+connect(workspace:GetPropertyChangedSignal("CurrentCamera"), bindCamera)
+bindCamera()
+connect(header.InputBegan, function(input)
+    local kind = input.UserInputType
+    if kind ~= Enum.UserInputType.MouseButton1 and kind ~= Enum.UserInputType.Touch then return end
+    if input.Position.X >= minimize.AbsolutePosition.X then return end
+    dragging, dragInput, dragStart, startPosition = true, input, input.Position, panel.Position
 end)
 connect(UIS.InputChanged, function(input)
-    if dragging and input == dragInput and dragStart and startPos then
-        local delta = input.Position - dragStart
-        panel.Position = UDim2.new(
-            startPos.X.Scale, startPos.X.Offset + delta.X,
-            startPos.Y.Scale, startPos.Y.Offset + delta.Y
-        )
-    end
+    if not dragging or not dragStart then return end
+    if input.UserInputType ~= Enum.UserInputType.MouseMovement and input ~= dragInput then return end
+    local delta = input.Position - dragStart
+    panel.Position = UDim2.fromOffset(startPosition.X.Offset + delta.X, startPosition.Y.Offset + delta.Y)
+    fitPanel()
 end)
 connect(UIS.InputEnded, function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1
-        or input.UserInputType == Enum.UserInputType.Touch then
-        dragging = false
-        dragInput, dragStart, startPos = nil, nil, nil
+    if input == dragInput or input.UserInputType == Enum.UserInputType.MouseButton1 then
+        dragging, dragInput, dragStart, startPosition = false, nil, nil, nil
     end
 end)
+local function renderDashboard()
+    toggle.Text = enabled and "■  DỪNG FARM" or "▶  BẬT FARM"
+    toggle.BackgroundColor3 = enabled and C.red or C.button
+    onLabel.Text, onLabel.TextColor3 = enabled and "● ON" or "● OFF", enabled and C.green or C.muted
+    local visited = 0
+    for _, point in ipairs(patrol.points) do if point.visited == patrol.pass then visited = visited + 1 end end
+    local owned, blocked, waiting = getStoreSummary()
+    local fruitCount = 0
+    for _ in pairs(fruitRecords) do fruitCount = fruitCount + 1 end
+    refs.team.Text = tostring(currentTeamName() or "Chờ chọn team")
+    refs.event.Text = config.EventScheduleEnabled and ((eventWindow.active and "ĐANG MỞ " or "TIẾP THEO ")
+        .. string.format("%02d:%02d", math.floor(eventWindow.remaining / 60), math.floor(eventWindow.remaining % 60))) or "LỊCH TẮT"
+    refs.camp.Text = patrol.pass .. " • " .. visited .. "/" .. #patrol.points
+    refs.magnet.Text, refs.owned.Text = tostring(#targets), tostring(#owned)
+    refs.events.Text, refs.fruits.Text = tostring(eventCount), tostring(fruitCount)
+    refs.blocked.Text = waiting .. "/" .. blocked
+    refs.auto.Text = randomToken.locked and "LỖI" or (config.AutoRandomToken and "ON" or "OFF")
+    refs.auto.TextColor3 = randomToken.locked and C.red or (config.AutoRandomToken and C.green or C.muted)
+    refs.portal.Text = short(portal.lastResult, 65)
+    local url = tostring(env.WebhookURL or config.WebhookURL or "")
+    refs.webhook.Text = config.WebhookEnabled and url:match("^https://")
+        and ("ON • " .. tostring(env.WebhookMinRarity or config.WebhookMinRarity)) or "OFF"
+    targetLabel.Text = short(status, 150)
+    refs.random.Text = "Token: " .. short(randomToken.status, 95)
+end
+renderDashboard()
 function api.Destroy()
     if not alive then return end
     if waterPlatform then waterPlatform:Destroy(); waterPlatform = nil end
@@ -2711,11 +2497,11 @@ function api.Destroy()
     gui:Destroy()
     if env.EventMagnetFarm == api then env.EventMagnetFarm = nil end
 end
-connect(toggle.MouseButton1Click, function() api.SetEnabled(not enabled) end)
-connect(close.MouseButton1Click, api.Destroy)
-connect(topClose.MouseButton1Click, api.Destroy)
+connect(toggle.Activated, function() api.SetEnabled(not enabled) end)
+connect(close.Activated, api.Destroy)
+connect(topClose.Activated, api.Destroy)
 connect(player.CharacterRemoving, function()
-    cancelAction("CharacterRemoving"); resetTarget(); hop.readyAt = nil; status = "Cho respawn..."
+    cancelAction("CharacterRemoving"); resetTarget(); status = "Cho respawn..."
 end)
 connect(player.CharacterAdded, function()
     cancelAction("CharacterAdded"); resetTarget(); scanClock = config.ScanInterval
@@ -2753,38 +2539,7 @@ connect(RunService.Heartbeat, function(dt)
         randomTokenStep()
         if uiClock >= 0.3 then
             uiClock = 0
-            toggle.Text = enabled and "DỪNG FARM" or "BẬT FARM"
-            toggle.BackgroundColor3 = enabled and C.red or C.button
-            onDot.TextColor3 = enabled and C.green or C.muted
-            onLabel.TextColor3 = enabled and C.green or C.muted
-            onLabel.Text = enabled and "ON" or "OFF"
-
-            local visited = 0
-            for _, point in ipairs(patrol.points) do
-                if point.visited == patrol.pass then visited = visited + 1 end
-            end
-            local owned, blocked, waiting = getStoreSummary()
-            local fruitCount = 0
-            for _ in pairs(fruitRecords) do fruitCount = fruitCount + 1 end
-
-            teamValue.Text = tostring(currentTeamName() or teamSelect.lastResult)
-            eventTimeValue.Text = config.EventScheduleEnabled
-                and ((eventWindow.active and "MỞ " or "CHỜ ") .. string.format("%02d:%02d", math.floor(eventWindow.remaining / 60), math.floor(eventWindow.remaining % 60)))
-                or "TẮT"
-            roundValue.Text = tostring(patrol.pass)
-            areaValue.Text = tostring(visited) .. " / " .. tostring(#patrol.points)
-
-            magnetizedValue.Text = tostring(#targets)
-            ownedValue.Text = tostring(#owned)
-            randomValue.Text = randomToken.status
-            eventCountValue.Text = tostring(eventCount)
-            fruitMapValue.Text = tostring(fruitCount)
-            waitBlockValue.Text = tostring(waiting) .. " / " .. tostring(blocked)
-
-            portalValue.Text = short(portal.lastResult, 42)
-            hopValue.Text = short(hop.status, 44)
-
-            targetLabel.Text = short(status, 95)
+            renderDashboard()
         end
     end)
     if not ok then
@@ -2792,22 +2547,6 @@ connect(RunService.Heartbeat, function(dt)
         status = "Loi: da dung farm. Xem GetLogs()."
         targetLabel.Text = status
         if os.clock() - lastError > 5 then lastError = os.clock(); log("ERROR", err) end
-    end
-end)
--- Same 30-second interval as the supplied code (its 90-second comment was stale).
-task.spawn(function()
-    task.wait(2)
-    while alive and sessionSerial == env.__EventMagnetSessionSerial do
-        if enabled and config.HopApiUrl ~= "" and game.JobId ~= "" then
-            -- Only this coroutine sends heartbeats: a hanging HTTP request cannot
-            -- spawn another one, and a stopped/rerun session exits afterwards.
-            pcall(function()
-                workerRequest("/api/heartbeat", {
-                    username = player.Name, jobId = game.JobId, placeId = tostring(game.PlaceId),
-                })
-            end)
-        end
-        task.wait(config.HopHeartbeatInterval)
     end
 end)
 end -- dashboard function
