@@ -72,6 +72,10 @@ local config = {
     FruitPickupAttempts = 3, FruitRetryDelay = 60,
     StoreFruit = true, StoreRetryDelay = 15, StoreAttempts = 3,
     AutoRandomToken = true, WebhookURL = "",
+    WebhookEnabled = true, WebhookOnPickup = true, WebhookOnRandom = true, WebhookOnStore = true,
+    WebhookMinRarity = "Legendary", WebhookUsername = "Noti Fruit", WebhookTitle = "Noti Fruit",
+    WebhookFooterText = "Dev By Gia Yêu Em", WebhookColor = 16776960,
+    WebhookPing = "", WebhookAvatarURL = "", WebhookBannerURL = "",
     AutoCloseSpinner = true, AutoHideItemNotice = true,
     BringMobs = true, BringMobCount = 2, BringMobRadius = 200,
     BringActivationRange = 50, BringPlayerSafeRange = 300, BringMobInterval = 0.1,
@@ -911,6 +915,105 @@ local function getStoreSummary()
     end
     return owned, blocked, waiting
 end
+-- Webhook format/events/rarity filter adapted from auto_factory.lua.
+-- Only this queue sends HTTP; no Worker, hop API or downloaded code.
+local sendFruitWebhook
+do
+    local fruitInfo, queue = nil, {}
+    local seen = setmetatable({}, {__mode = "k"})
+    local tiers = {common = 1, uncommon = 2, rare = 3, legendary = 4, mythical = 5}
+    local fallback = {
+        kitsune = 5, dragon = 5, leopard = 5, ["t-rex"] = 5, trex = 5,
+        mammoth = 5, dough = 5, shadow = 5, venom = 5, control = 5, spirit = 5, gravity = 5,
+        portal = 4, blizzard = 4, rumble = 4, buddha = 4, sound = 4, phoenix = 4,
+        spider = 4, string = 4, love = 4, pain = 4, paw = 4, quake = 4,
+    }
+    task.spawn(function()
+        local module = RS:WaitForChild("FruitInfo", 5)
+        local ok, data = pcall(function() return module and require(module) end)
+        if alive and env.EventMagnetFarm == api and ok and type(data) == "table" then
+            fruitInfo = data.List
+        end
+    end)
+    local function tierOf(name, storageName)
+        local wanted = fruitIdentity(storageName or name)
+        if type(fruitInfo) == "table" then
+            for key, row in pairs(fruitInfo) do
+                if type(key) == "string" and fruitIdentity(key) == wanted and type(row) == "table" then
+                    local rarity = type(row.Rarity) == "table" and row.Rarity.Name or row.Rarity
+                    if type(rarity) == "string" and tiers[rarity:lower()] then return tiers[rarity:lower()] end
+                end
+            end
+        end
+        return fallback[wanted] or 0
+    end
+    sendFruitWebhook = function(eventType, fruitName, tool, storageName)
+        if not alive or env.EventMagnetFarm ~= api or not config.WebhookEnabled then return end
+        if eventType == "Picked" and not config.WebhookOnPickup
+            or eventType == "Random" and not config.WebhookOnRandom
+            or eventType == "Stored" and not config.WebhookOnStore then return end
+        local url = tostring(env.WebhookURL or ""):match("^%s*(.-)%s*$")
+        if url == "" then url = tostring(config.WebhookURL or ""):match("^%s*(.-)%s*$") end
+        if url == "" then return end
+        if not url:match("^https://") then log("WEBHOOK", "URL phai bat dau bang https://"); return end
+        local minimum = tostring(env.WebhookMinRarity or config.WebhookMinRarity):lower()
+        local threshold = minimum == "all" and 0 or (minimum == "mythical" and 5 or 4)
+        if tierOf(fruitName, storageName) < threshold then return end
+        if tool then
+            seen[tool] = seen[tool] or {}
+            if seen[tool][eventType] then return end
+            seen[tool][eventType] = true
+        end
+        if #queue >= 50 then log("WEBHOOK", "Hang doi day; bo qua thong bao moi"); return end
+        local titles = {Picked = "Picked Fruit", Random = "Random Fruit", Stored = "Stored Fruit"}
+        local embed = {
+            title = config.WebhookTitle, description = "**Main Status**\nUsername : ||" .. player.Name .. "||",
+            color = config.WebhookColor, footer = {text = config.WebhookFooterText},
+            timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+            fields = {
+                {name = titles[eventType] or "Fruit", value = "```\n" .. short(fruitName, 150) .. "\n```", inline = false},
+                {name = "Username", value = "||" .. player.Name .. "||", inline = true},
+                {name = "Time", value = os.date("%Y-%m-%d %H:%M:%S"), inline = true},
+                {name = "PlaceId", value = tostring(game.PlaceId), inline = true},
+            },
+        }
+        if config.WebhookBannerURL:match("^https://") then embed.thumbnail = {url = config.WebhookBannerURL} end
+        local payload = {content = config.WebhookPing, username = config.WebhookUsername, embeds = {embed},
+            allowed_mentions = {parse = {}}}
+        -- Pings are opt-in; never infer @everyone from a fruit notification.
+        if config.WebhookPing == "@everyone" or config.WebhookPing == "@here" then
+            payload.allowed_mentions = {parse = {"everyone"}}
+        end
+        if config.WebhookAvatarURL:match("^https://") then payload.avatar_url = config.WebhookAvatarURL end
+        queue[#queue + 1] = {url = url, payload = payload}
+    end
+    task.spawn(function()
+        while alive and env.EventMagnetFarm == api do
+            task.wait(0.5)
+            if not alive or env.EventMagnetFarm ~= api then break end
+            local entry = table.remove(queue, 1)
+            if entry then
+                local requestFn = (type(request) == "function" and request)
+                    or (type(http_request) == "function" and http_request)
+                    or (type(syn) == "table" and syn.request) or (type(http) == "table" and http.request)
+                    or (type(fluxus) == "table" and fluxus.request)
+                if type(requestFn) ~= "function" then log("WEBHOOK", "Executor khong ho tro HTTP")
+                else
+                    local ok, response = pcall(function()
+                        return requestFn({Url = entry.url, Method = "POST",
+                            Headers = {["Content-Type"] = "application/json"},
+                            Body = HttpService:JSONEncode(entry.payload)})
+                    end)
+                    if alive then
+                        local code = type(response) == "table" and tonumber(response.StatusCode or response.Status or response.status_code)
+                        log("WEBHOOK", ok and code and code >= 200 and code < 300
+                            and "Da gui" or "Gui loi/chua xac nhan; khong tu gui lai")
+                    end
+                end
+            end
+        end
+    end)
+end
 local function startStore(item, force)
     if not config.StoreFruit or action.kind or randomToken.busy then return false end
     local record = storeRecords[item] or { attempts = 0, retryAt = 0, blocked = false }
@@ -957,6 +1060,7 @@ local function startStore(item, force)
             record.blocked, record.last = false, "Da luu xac nhan"
             record.retryAt, record.attempts = os.clock() + config.StoreRetryDelay, 0
             log("STORE", short(item.Name, 80) .. ": da luu")
+            sendFruitWebhook("Stored", item.Name, item, storageName)
         else
             -- Ported from auto_factory: a completed call with a remaining Tool
             -- is skipped for this instance; transport failures remain retryable.
@@ -994,9 +1098,9 @@ end)
 connect(workspace.ChildRemoved, removeFruitRecord)
 refreshFruits()
 
--- Spinner/banner handling ported from auto_factory.lua; only after our rolls.
+-- Same lifecycle as auto_factory: watch while enabled, not just a short roll timer.
 do
-    local spinnerController
+    local spinnerController, lastClose = nil, 0
     task.spawn(function()
         local ok, controller = pcall(function()
             local controllers = RS:WaitForChild("Controllers", 10)
@@ -1008,31 +1112,39 @@ do
             spinnerController = controller
         end
     end)
+    local function showing(item)
+        return item and ((item:IsA("ScreenGui") and item.Enabled) or (item:IsA("GuiObject") and item.Visible))
+    end
+    local function hide(item)
+        if item:IsA("ScreenGui") then item.Enabled = false
+        elseif item:IsA("GuiObject") then item.Visible = false end
+    end
     task.spawn(function()
         while alive and env.EventMagnetFarm == api do
             task.wait(0.2)
             if not alive or env.EventMagnetFarm ~= api then break end
-            if enabled and os.clock() < (randomToken.hideUntil or 0) then
+            if enabled then
                 pcall(function()
                     local pg = player:FindFirstChildOfClass("PlayerGui")
                     if not pg then return end
                     local window = pg:FindFirstChild("SpinnerWindow")
-                    if config.AutoCloseSpinner and window and window:IsA("ScreenGui") and window.Enabled then
+                    if config.AutoCloseSpinner and showing(window) then
                         local above = window:FindFirstChild("AboveSpinner")
                         local navigation = above and above:FindFirstChild("Navigation")
                         local close = navigation and navigation:FindFirstChild("CloseButton")
-                        if close and close:IsA("GuiObject") and close.Visible then
+                        if close and close:IsA("GuiObject") and close.Visible and os.clock() - lastClose >= 0.5 then
+                            lastClose = os.clock()
                             local closed = false
                             if spinnerController and type(spinnerController.Close) == "function" then
                                 closed = pcall(function() spinnerController:Close() end)
                             end
-                            if not closed then window.Enabled = false end
+                            if not closed then hide(window) end
                         end
                     end
                     if config.AutoHideItemNotice then
                         for _, name in ipairs({"Item", "ItemUI"}) do
                             local notice = pg:FindFirstChild(name)
-                            if notice and notice:IsA("ScreenGui") then notice.Enabled = false end
+                            if showing(notice) then hide(notice) end
                         end
                     end
                 end)
@@ -2018,6 +2130,7 @@ local function startFruitPickup(record, root, humanoid)
             failFruit(record, "Khong kich hoat duoc touch")
         elseif found then
             log("FRUIT", "Da xac nhan nhat: " .. short(found.Name, 80))
+            sendFruitWebhook("Picked", found.Name, found, getFruitOriginalName(found))
             fruitTask.target, fruitTask.started = nil, nil
         else
             failFruit(record, "Da cham nhung chua vao inventory")
@@ -2111,7 +2224,6 @@ local function randomTokenStep()
             local before = {}
             for _, item in ipairs(ownedFruitTools()) do before[item] = true end
             dispatched = true
-            randomToken.hideUntil = os.clock() + 15
             randomToken.status = "Quay 500 Magnet Token"
             local accepted, details = rf:InvokeServer({Context = "Purchase", BoxName = "MagnetEventGacha26"})
             if not current() then return end
@@ -2122,41 +2234,24 @@ local function randomTokenStep()
                 randomToken.locked, randomToken.status = true, "Purchase chua ro; dung random"
                 return
             end
-            task.wait(2)
-            if not current() then return end
-            randomToken.hideUntil = os.clock() + 10
             local rewards = {}
-            for _, item in ipairs(ownedFruitTools()) do
-                if not before[item] then rewards[#rewards + 1] = item.Name end
-            end
+            -- auto_factory waits for a real reward Tool; don't invent a fruit from Purchase=true.
+            local rewardDeadline = os.clock() + 8
+            repeat
+                task.wait(0.1)
+                if not current() then return end
+                rewards = {}
+                for _, item in ipairs(ownedFruitTools()) do
+                    if not before[item] then rewards[#rewards + 1] = item.Name end
+                end
+            until #rewards > 0 or os.clock() >= rewardDeadline
             randomToken.status = #rewards > 0 and ("Nhan " .. table.concat(rewards, ", "))
                 or "Server chap nhan; chua thay Fruit"
             log("RANDOM", randomToken.status)
-            local url, message = config.WebhookURL, randomToken.status
-            if type(url) == "string" and url:match("^https://") then
-                task.spawn(function()
-                    if not alive then return end
-                    local sent, response = pcall(function()
-                        return hopRequest({Url = url, Method = "POST",
-                            Headers = {["Content-Type"] = "application/json"},
-                            Body = HttpService:JSONEncode({username = "Magnet Farm V2",
-                                allowed_mentions = {parse = {}}, embeds = {{
-                                    title = "Magnet Token Random", description = message,
-                                    fields = {{name = "Player", value = player.Name},
-                                        {name = "PlaceId", value = tostring(game.PlaceId)},
-                                        {name = "Token truoc quay", value = tostring(price.Current)}},
-                                    footer = {text = "Dev By Gia Yêu Em"},
-                                    timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
-                                }}})})
-                    end)
-                    if alive and (not sent or type(response) ~= "table"
-                        or (tonumber(response.StatusCode) or 0) < 200
-                        or (tonumber(response.StatusCode) or 0) >= 300) then
-                        log("WEBHOOK", "Gui that bai; khong tu gui lai")
-                    end
-                end)
+            for _, item in ipairs(ownedFruitTools()) do
+                if not before[item] then sendFruitWebhook("Random", item.Name, item, getFruitOriginalName(item)) end
             end
-            randomToken.retryAt = os.clock() + 3
+            randomToken.retryAt = os.clock() + (#rewards > 0 and 3 or 30)
         end)
         if not current() then return end
         if not ok then
@@ -2229,11 +2324,28 @@ local function restoreSeatGuard()
     end
     seatGuard.humanoid, seatGuard.original = nil, nil
 end
+local function needsMovement()
+    if not alive or not enabled then return false end
+    local character = player.Character
+    local root = rootOf(character)
+    if not root or not character:FindFirstChild("HasBuso") or not teamSelect.ready then return false end
+    if action.kind == "hop" then return false end
+    if action.kind == "portal" or action.kind == "pickup" then return true end
+    if hasLiveMagnetized() then return true end
+    if action.kind == "store" then return false end
+    if config.Patrol and (not config.EventScheduleEnabled or eventWindow.active) and #patrol.points > 0 then return true end
+    if config.FruitEnabled and not eventWindow.active then
+        local owned, blocked = getStoreSummary()
+        return #owned == blocked and nearestFruit(root, os.clock()) ~= nil
+    end
+    return false
+end
 local function updateSeatGuard()
     local character = player.Character
     local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-    if seatGuard.humanoid ~= humanoid or not enabled or not alive then restoreSeatGuard() end
-    if not alive or not enabled or not humanoid or humanoid.Health <= 0 then return end
+    local moving = needsMovement()
+    if seatGuard.humanoid ~= humanoid or not moving then restoreSeatGuard() end
+    if not moving or not humanoid or humanoid.Health <= 0 then return end
     if not seatGuard.humanoid then
         seatGuard.original = humanoid:GetStateEnabled(Enum.HumanoidStateType.Seated)
         seatGuard.humanoid = humanoid
@@ -2245,6 +2357,11 @@ local function recoverFromSeat(root, humanoid, now)
     if seatRecovery.root ~= root then
         seatRecovery.root, seatRecovery.nextAttempt, seatRecovery.pending = root, 0, false
         seatRecovery.started, seatRecovery.clearSince = nil, nil
+    end
+    if not needsMovement() then
+        restoreSeatGuard()
+        seatRecovery.pending, seatRecovery.started, seatRecovery.clearSince = false, nil, nil
+        return false
     end
     if humanoid.Sit or humanoid.SeatPart then
         releaseMovement()
@@ -2287,8 +2404,6 @@ local function recoverFromSeat(root, humanoid, now)
     end
     return false
 end
--- Recheck population on every entry, even if a previous hop chose this server.
-hop.checked = false
 -- Match the fought mob to its actual camp, not the interrupted patrol stop.
 local function combatCampAt(position)
     local best, distance
@@ -2569,221 +2684,188 @@ if not mounted then
     error("Khong the hien EventMagnetFarmUI qua gethui/CoreGui/PlayerGui")
 end
 local UIS = game:GetService("UserInputService")
-
--- Compact Dashboard V2: UI-only replacement. Farm/event/patrol/portal/hop logic stays unchanged.
 local C = {
-    bg = Color3.fromRGB(7, 16, 28),
-    card = Color3.fromRGB(10, 25, 40),
-    card2 = Color3.fromRGB(11, 29, 46),
-    border = Color3.fromRGB(0, 160, 255),
-    borderSoft = Color3.fromRGB(18, 112, 180),
-    text = Color3.fromRGB(232, 242, 255),
-    muted = Color3.fromRGB(145, 184, 220),
-    cyan = Color3.fromRGB(38, 181, 255),
-    green = Color3.fromRGB(50, 244, 128),
-    yellow = Color3.fromRGB(255, 191, 46),
-    red = Color3.fromRGB(225, 43, 72),
-    button = Color3.fromRGB(24, 50, 79),
+    bg = Color3.fromRGB(3, 20, 35), card = Color3.fromRGB(4, 28, 47),
+    cyan = Color3.fromRGB(0, 218, 255), line = Color3.fromRGB(12, 89, 125),
+    text = Color3.fromRGB(228, 243, 255), muted = Color3.fromRGB(142, 188, 224),
+    green = Color3.fromRGB(0, 241, 130), yellow = Color3.fromRGB(255, 207, 0),
+    red = Color3.fromRGB(225, 15, 62), button = Color3.fromRGB(5, 43, 81),
 }
-
 local panel = Instance.new("Frame")
-panel.Name = "CompactDashboard"
-panel.Size = UDim2.fromOffset(420, 474)
-panel.Position = UDim2.new(0, 12, 0.5, -237)
-panel.BackgroundColor3 = C.bg
-panel.BorderSizePixel = 0
-panel.ClipsDescendants = true
-panel.Active = true
-panel.Parent = gui
-
-local panelCorner = Instance.new("UICorner")
-panelCorner.CornerRadius = UDim.new(0, 12)
-panelCorner.Parent = panel
-local panelStroke = Instance.new("UIStroke")
-panelStroke.Color = C.border
-panelStroke.Thickness = 1.5
-panelStroke.Transparency = 0.05
-panelStroke.Parent = panel
-
-local function corner(parent, radius)
-    local c = Instance.new("UICorner")
-    c.CornerRadius = UDim.new(0, radius or 8)
-    c.Parent = parent
-    return c
+panel.Name, panel.Size = "MagnetDashboard", UDim2.fromOffset(560, 680)
+panel.AnchorPoint, panel.Position = Vector2.new(0.5, 0.5), UDim2.fromScale(0.5, 0.5)
+panel.BackgroundColor3, panel.BorderSizePixel = C.bg, 0
+panel.Active, panel.ClipsDescendants, panel.Parent = true, true, gui
+local scale = Instance.new("UIScale")
+scale.Parent = panel
+local function rounded(parent, radius, color, thickness)
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius, corner.Parent = UDim.new(0, radius), parent
+    if color then
+        local outline = Instance.new("UIStroke")
+        outline.Color, outline.Thickness, outline.Parent = color, thickness or 1, parent
+    end
 end
-
-local function stroke(parent, color, thickness, transparency)
-    local s = Instance.new("UIStroke")
-    s.Color = color or C.borderSoft
-    s.Thickness = thickness or 1
-    s.Transparency = transparency or 0
-    s.Parent = parent
-    return s
+rounded(panel, 16, C.cyan, 2)
+local function text(parent, value, x, y, w, h, size, color, bold)
+    local label = Instance.new("TextLabel")
+    label.Position, label.Size = UDim2.fromOffset(x, y), UDim2.fromOffset(w, h)
+    label.Text, label.TextSize = value, size or 16
+    label.TextColor3, label.BackgroundTransparency = color or C.text, 1
+    label.Font = bold and Enum.Font.GothamBold or Enum.Font.Gotham
+    label.TextWrapped, label.TextXAlignment = true, Enum.TextXAlignment.Left
+    label.Parent = parent
+    return label
 end
-
-local function text(parent, value, x, y, w, h, size, color, bold, xAlign, yAlign)
-    local t = Instance.new("TextLabel")
-    t.BackgroundTransparency = 1
-    t.Position = UDim2.fromOffset(x, y)
-    t.Size = UDim2.fromOffset(w, h)
-    t.Text = value or ""
-    t.TextColor3 = color or C.text
-    t.TextSize = size or 12
-    t.Font = bold and Enum.Font.GothamBold or Enum.Font.Gotham
-    t.TextXAlignment = xAlign or Enum.TextXAlignment.Left
-    t.TextYAlignment = yAlign or Enum.TextYAlignment.Center
-    t.TextWrapped = true
-    t.BorderSizePixel = 0
-    t.Parent = parent
-    return t
+local function card(parent, x, y, w, h)
+    local frame = Instance.new("Frame")
+    frame.Position, frame.Size = UDim2.fromOffset(x, y), UDim2.fromOffset(w, h)
+    frame.BackgroundColor3, frame.BorderSizePixel, frame.Parent = C.card, 0, parent
+    rounded(frame, 10, C.line, 1)
+    return frame
 end
-
-local function card(x, y, w, h)
-    local f = Instance.new("Frame")
-    f.Position = UDim2.fromOffset(x, y)
-    f.Size = UDim2.fromOffset(w, h)
-    f.BackgroundColor3 = C.card
-    f.BorderSizePixel = 0
-    f.Parent = panel
-    corner(f, 8)
-    stroke(f, C.borderSoft, 1, 0.08)
-    return f
+local function button(parent, label, x, y, w, h, color)
+    local item = Instance.new("TextButton")
+    item.Position, item.Size = UDim2.fromOffset(x, y), UDim2.fromOffset(w, h)
+    item.Text, item.Font, item.TextSize = label, Enum.Font.GothamBold, 18
+    item.BackgroundColor3, item.TextColor3 = color or C.button, C.text
+    item.BorderSizePixel, item.Parent = 0, parent
+    rounded(item, 9, C.cyan, 1)
+    return item
 end
-
-local function infoCard(x, y, titleText)
-    local f = card(x, y, 194, 48)
-    text(f, titleText, 10, 5, 174, 13, 9, C.muted, true)
-    local value = text(f, "-", 10, 20, 174, 22, 14, C.text, true)
+local header = Instance.new("Frame")
+header.Name, header.Size, header.BackgroundTransparency = "DragHandle", UDim2.new(1, 0, 0, 54), 1
+header.Active, header.Parent = true, panel
+local titleLabel = text(header, "MAGNETIZED FARM V2", 20, 9, 370, 34, 24, C.text, true)
+local onLabel = text(header, "● ON", 405, 10, 68, 32, 20, C.green, true)
+local minimize = button(header, "−", 476, 10, 32, 32)
+local topClose = button(header, "×", 516, 10, 32, 32)
+local body = Instance.new("Frame")
+body.Name, body.Size, body.BackgroundTransparency = "DashboardBody", UDim2.fromScale(1, 1), 1
+body.Parent = panel
+-- Keep header above the transparent body so drag/minimize/close remain clickable.
+header.ZIndex = 3
+for _, child in ipairs(header:GetChildren()) do if child:IsA("GuiObject") then child.ZIndex = 4 end end
+local refs = {}
+text(body, "●  USER", 22, 64, 102, 25, 15, C.muted, true)
+text(body, "@" .. player.Name, 128, 62, 406, 29, 19, C.text, true)
+local teamCard = card(body, 18, 108, 169, 76)
+text(teamCard, "♟ TEAM", 12, 8, 145, 20, 13, C.muted, true)
+refs.team = text(teamCard, "-", 12, 31, 145, 34, 20, C.text, true)
+local eventCard = card(body, 195, 108, 169, 76)
+text(eventCard, "◷ EVENT", 12, 8, 145, 20, 13, C.muted, true)
+refs.event = text(eventCard, "-", 12, 31, 145, 34, 16, C.yellow, true)
+local campCard = card(body, 372, 108, 170, 76)
+text(campCard, "⌖ VÒNG / BÃI", 12, 8, 146, 20, 13, C.muted, true)
+refs.camp = text(campCard, "-", 12, 31, 146, 34, 21, C.text, true)
+local counts = card(body, 18, 196, 524, 112)
+local function counter(label, x, y)
+    text(counts, label, x, y, 136, 25, 16, C.muted, false)
+    local value = text(counts, "0", x + 138, y, 90, 25, 17, C.text, true)
+    value.TextXAlignment = Enum.TextXAlignment.Right
     return value
 end
-
--- Header / drag handle.
-local header = Instance.new("Frame")
-header.Name = "DragHandle"
-header.Size = UDim2.new(1, 0, 0, 46)
-header.BackgroundTransparency = 1
-header.Active = true
-header.Parent = panel
-
-local titleLabel = text(header, "MAGNETIZED FARM V2", 14, 3, 270, 23, 14, C.text, true)
-text(header, "Dev By Gia Yêu Em", 14, 26, 270, 15, 11, C.muted, false)
-local onDot = text(header, "●", 292, 7, 18, 30, 14, C.green, true, Enum.TextXAlignment.Center)
-local onLabel = text(header, "ON", 309, 7, 34, 30, 12, C.green, true, Enum.TextXAlignment.Left)
-text(header, "—", 349, 6, 24, 30, 16, C.muted, false, Enum.TextXAlignment.Center)
-
-local topClose = Instance.new("TextButton")
-topClose.Name = "TopClose"
-topClose.Position = UDim2.fromOffset(379, 6)
-topClose.Size = UDim2.fromOffset(29, 30)
-topClose.BackgroundTransparency = 1
-topClose.Text = "×"
-topClose.TextColor3 = C.text
-topClose.TextSize = 24
-topClose.Font = Enum.Font.Gotham
-topClose.Parent = header
-
-local divider = Instance.new("Frame")
-divider.Position = UDim2.fromOffset(12, 44)
-divider.Size = UDim2.new(1, -24, 0, 1)
-divider.BackgroundColor3 = C.borderSoft
-divider.BorderSizePixel = 0
-divider.Parent = panel
-
-local teamValue = infoCard(12, 54, "TEAM")
-local eventTimeValue = infoCard(214, 54, "EVENT")
-eventTimeValue.TextColor3 = C.yellow
-local roundValue = infoCard(12, 110, "VÒNG")
-roundValue.TextColor3 = C.yellow
-local areaValue = infoCard(214, 110, islandMode and "ĐẢO" or "BÃI")
-areaValue.TextColor3 = C.yellow
-
--- Counters.
-local counterCard = card(12, 166, 396, 92)
-local counterDivider = Instance.new("Frame")
-counterDivider.Position = UDim2.fromOffset(198, 10)
-counterDivider.Size = UDim2.fromOffset(1, 72)
-counterDivider.BackgroundColor3 = C.borderSoft
-counterDivider.BorderSizePixel = 0
-counterDivider.Parent = counterCard
-
-local function counterRow(parent, x, y, labelText, valueColor)
-    text(parent, labelText, x, y, 96, 22, 12, C.text, false)
-    return text(parent, "0", x + 98, y, 66, 22, 13, valueColor or C.green, true, Enum.TextXAlignment.Right)
+refs.magnet = counter("Magnetized", 14, 10)
+refs.owned = counter("Giữ", 14, 43)
+refs.auto = counter("Auto token", 14, 76)
+refs.events = counter("Event", 280, 10)
+refs.fruits = counter("Fruit map", 280, 43)
+refs.blocked = counter("Chờ/chặn", 280, 76)
+local system = card(body, 18, 320, 524, 112)
+text(system, "⚙  HỆ THỐNG", 14, 8, 490, 26, 17, C.muted, true)
+text(system, "Portal", 14, 36, 110, 22, 15, C.muted)
+refs.portal = text(system, "-", 130, 36, 380, 22, 14)
+text(system, "Hop", 14, 60, 110, 22, 15, C.muted)
+refs.hop = text(system, "-", 130, 60, 380, 22, 14)
+text(system, "Webhook", 14, 84, 110, 22, 15, C.muted)
+refs.webhook = text(system, "-", 130, 84, 380, 22, 14)
+local stateCard = card(body, 18, 444, 524, 112)
+text(stateCard, "⌁  TRẠNG THÁI", 14, 6, 490, 25, 17, C.cyan, true)
+local targetLabel = text(stateCard, "Đang khởi động...", 14, 34, 496, 40, 17, C.cyan, true)
+refs.random = text(stateCard, "-", 14, 77, 496, 25, 12, C.muted)
+local toggle = button(body, "■  DỪNG FARM", 18, 568, 256, 52, C.red)
+local close = button(body, "⇥  THOÁT", 286, 568, 256, 52, C.button)
+local footer = text(body, "Dev By Gia Yêu Em", 18, 637, 524, 27, 20, C.cyan)
+footer.TextXAlignment = Enum.TextXAlignment.Center
+local collapsed, dragging, dragInput, dragStart, startPosition = false, false, nil, nil, nil
+local cameraConnection
+local function viewport()
+    return workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(1280, 720)
 end
-local magnetizedValue = counterRow(counterCard, 16, 7, "Magnetized", C.green)
-local ownedValue = counterRow(counterCard, 16, 34, "Giữ", C.green)
-local randomValue = text(counterCard, "Auto token: ON", 16, 61, 175, 26, 10, C.cyan, false)
-local eventCountValue = counterRow(counterCard, 210, 7, "Event", C.yellow)
-local fruitMapValue = counterRow(counterCard, 210, 34, "Fruit map", C.yellow)
-local waitBlockValue = counterRow(counterCard, 210, 61, "Chờ/chặn", C.yellow)
-
--- Portal / hop summary.
-local systemCard = card(12, 266, 396, 58)
-text(systemCard, "Portal", 14, 5, 55, 22, 11, C.muted, false)
-text(systemCard, ":", 70, 5, 10, 22, 11, C.muted, false)
-local portalValue = text(systemCard, "Chưa dùng", 84, 5, 294, 22, 11, C.green, true)
-text(systemCard, "Hop", 14, 30, 55, 22, 11, C.muted, false)
-text(systemCard, ":", 70, 30, 10, 22, 11, C.muted, false)
-local hopValue = text(systemCard, "Chờ kiểm tra đầu phiên", 84, 30, 294, 22, 11, C.green, true)
-
--- Logs remain available through GetLogs(), but are not displayed on the UI.
-local targetCard = card(12, 332, 396, 88)
-text(targetCard, "TRẠNG THÁI", 12, 5, 372, 18, 10, C.cyan, true)
-local targetLabel = text(targetCard, "-", 12, 25, 372, 56, 11, C.text, false, Enum.TextXAlignment.Left, Enum.TextYAlignment.Top)
-
-local function button(parent, labelText, x, w, color)
-    local b = Instance.new("TextButton")
-    b.Position = UDim2.fromOffset(x, 428)
-    b.Size = UDim2.fromOffset(w, 34)
-    b.BackgroundColor3 = color
-    b.BorderSizePixel = 0
-    b.Text = labelText
-    b.TextColor3 = Color3.new(1, 1, 1)
-    b.TextSize = 12
-    b.Font = Enum.Font.GothamBold
-    b.AutoButtonColor = true
-    b.Parent = parent
-    corner(b, 8)
-    stroke(b, color == C.red and Color3.fromRGB(255, 72, 100) or C.borderSoft, 1, 0.05)
-    return b
+local function fitPanel()
+    local size = viewport()
+    if size.X < 40 or size.Y < 40 then return end
+    -- Same scale in expanded/collapsed states prevents position jumps on reopening.
+    scale.Scale = math.min(1, (size.X - 24) / 560, (size.Y - 24) / 680)
+    local half = Vector2.new(560, collapsed and 54 or 680) * scale.Scale / 2
+    local x = panel.Position.X.Scale * size.X + panel.Position.X.Offset
+    local y = panel.Position.Y.Scale * size.Y + panel.Position.Y.Offset
+    panel.Position = UDim2.fromOffset(
+        math.clamp(x, half.X + 8, size.X - half.X - 8),
+        math.clamp(y, half.Y + 8, size.Y - half.Y - 8))
 end
-
-local toggle = button(panel, "DỪNG FARM", 12, 244, C.red)
-local close = button(panel, "THOÁT", 264, 144, C.button)
-
--- Dragging uses input events only; no extra Heartbeat and no farm logic changes.
-local dragging = false
-local dragInput, dragStart, startPos
-connect(header.InputBegan, function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1
-        or input.UserInputType == Enum.UserInputType.Touch then
-        dragging = true
-        dragStart = input.Position
-        startPos = panel.Position
-    end
+connect(minimize.Activated, function()
+    collapsed = not collapsed
+    body.Visible = not collapsed
+    panel.Size = UDim2.fromOffset(560, collapsed and 54 or 680)
+    minimize.Text = collapsed and "+" or "−"
+    titleLabel.Text = collapsed and ("MAGNETIZED FARM V2 | @" .. player.Name) or "MAGNETIZED FARM V2"
+    titleLabel.TextSize = collapsed and 15 or 24
+    fitPanel()
 end)
-connect(header.InputChanged, function(input)
-    if input.UserInputType == Enum.UserInputType.MouseMovement
-        or input.UserInputType == Enum.UserInputType.Touch then
-        dragInput = input
-    end
+local function bindCamera()
+    if cameraConnection then cameraConnection:Disconnect() end
+    local camera = workspace.CurrentCamera
+    if camera then cameraConnection = connect(camera:GetPropertyChangedSignal("ViewportSize"), fitPanel) end
+    fitPanel()
+end
+connect(workspace:GetPropertyChangedSignal("CurrentCamera"), bindCamera)
+bindCamera()
+connect(header.InputBegan, function(input)
+    local kind = input.UserInputType
+    if kind ~= Enum.UserInputType.MouseButton1 and kind ~= Enum.UserInputType.Touch then return end
+    if input.Position.X >= minimize.AbsolutePosition.X then return end
+    dragging, dragInput, dragStart, startPosition = true, input, input.Position, panel.Position
 end)
 connect(UIS.InputChanged, function(input)
-    if dragging and input == dragInput and dragStart and startPos then
-        local delta = input.Position - dragStart
-        panel.Position = UDim2.new(
-            startPos.X.Scale, startPos.X.Offset + delta.X,
-            startPos.Y.Scale, startPos.Y.Offset + delta.Y
-        )
-    end
+    if not dragging or not dragStart then return end
+    if input.UserInputType ~= Enum.UserInputType.MouseMovement and input ~= dragInput then return end
+    local delta = input.Position - dragStart
+    panel.Position = UDim2.fromOffset(startPosition.X.Offset + delta.X, startPosition.Y.Offset + delta.Y)
+    fitPanel()
 end)
 connect(UIS.InputEnded, function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1
-        or input.UserInputType == Enum.UserInputType.Touch then
-        dragging = false
-        dragInput, dragStart, startPos = nil, nil, nil
+    if input == dragInput or input.UserInputType == Enum.UserInputType.MouseButton1 then
+        dragging, dragInput, dragStart, startPosition = false, nil, nil, nil
     end
 end)
+local function renderDashboard()
+    toggle.Text = enabled and "■  DỪNG FARM" or "▶  BẬT FARM"
+    toggle.BackgroundColor3 = enabled and C.red or C.button
+    onLabel.Text, onLabel.TextColor3 = enabled and "● ON" or "● OFF", enabled and C.green or C.muted
+    local visited = 0
+    for _, point in ipairs(patrol.points) do if point.visited == patrol.pass then visited = visited + 1 end end
+    local owned, blocked, waiting = getStoreSummary()
+    local fruitCount = 0
+    for _ in pairs(fruitRecords) do fruitCount = fruitCount + 1 end
+    refs.team.Text = tostring(currentTeamName() or "Chờ chọn team")
+    refs.event.Text = config.EventScheduleEnabled and ((eventWindow.active and "ĐANG MỞ " or "TIẾP THEO ")
+        .. string.format("%02d:%02d", math.floor(eventWindow.remaining / 60), math.floor(eventWindow.remaining % 60))) or "LỊCH TẮT"
+    refs.camp.Text = patrol.pass .. " • " .. visited .. "/" .. #patrol.points
+    refs.magnet.Text, refs.owned.Text = tostring(#targets), tostring(#owned)
+    refs.events.Text, refs.fruits.Text = tostring(eventCount), tostring(fruitCount)
+    refs.blocked.Text = waiting .. "/" .. blocked
+    refs.auto.Text = randomToken.locked and "LỖI" or (config.AutoRandomToken and "ON" or "OFF")
+    refs.auto.TextColor3 = randomToken.locked and C.red or (config.AutoRandomToken and C.green or C.muted)
+    refs.portal.Text = short(portal.lastResult, 65)
+    refs.hop.Text = short(hop.status, 65)
+    local url = tostring(env.WebhookURL or config.WebhookURL or "")
+    refs.webhook.Text = config.WebhookEnabled and url:match("^https://")
+        and ("ON • " .. tostring(env.WebhookMinRarity or config.WebhookMinRarity)) or "OFF"
+    targetLabel.Text = short(status, 150)
+    refs.random.Text = "Token: " .. short(randomToken.status, 95)
+end
+renderDashboard()
 function api.Destroy()
     if not alive then return end
     if waterPlatform then waterPlatform:Destroy(); waterPlatform = nil end
@@ -2804,9 +2886,9 @@ function api.Destroy()
     gui:Destroy()
     if env.EventMagnetFarm == api then env.EventMagnetFarm = nil end
 end
-connect(toggle.MouseButton1Click, function() api.SetEnabled(not enabled) end)
-connect(close.MouseButton1Click, api.Destroy)
-connect(topClose.MouseButton1Click, api.Destroy)
+connect(toggle.Activated, function() api.SetEnabled(not enabled) end)
+connect(close.Activated, api.Destroy)
+connect(topClose.Activated, api.Destroy)
 connect(player.CharacterRemoving, function()
     cancelAction("CharacterRemoving"); resetTarget(); hop.readyAt = nil; status = "Cho respawn..."
 end)
@@ -2846,38 +2928,7 @@ connect(RunService.Heartbeat, function(dt)
         randomTokenStep()
         if uiClock >= 0.3 then
             uiClock = 0
-            toggle.Text = enabled and "DỪNG FARM" or "BẬT FARM"
-            toggle.BackgroundColor3 = enabled and C.red or C.button
-            onDot.TextColor3 = enabled and C.green or C.muted
-            onLabel.TextColor3 = enabled and C.green or C.muted
-            onLabel.Text = enabled and "ON" or "OFF"
-
-            local visited = 0
-            for _, point in ipairs(patrol.points) do
-                if point.visited == patrol.pass then visited = visited + 1 end
-            end
-            local owned, blocked, waiting = getStoreSummary()
-            local fruitCount = 0
-            for _ in pairs(fruitRecords) do fruitCount = fruitCount + 1 end
-
-            teamValue.Text = tostring(currentTeamName() or teamSelect.lastResult)
-            eventTimeValue.Text = config.EventScheduleEnabled
-                and ((eventWindow.active and "MỞ " or "CHỜ ") .. string.format("%02d:%02d", math.floor(eventWindow.remaining / 60), math.floor(eventWindow.remaining % 60)))
-                or "TẮT"
-            roundValue.Text = tostring(patrol.pass)
-            areaValue.Text = tostring(visited) .. " / " .. tostring(#patrol.points)
-
-            magnetizedValue.Text = tostring(#targets)
-            ownedValue.Text = tostring(#owned)
-            randomValue.Text = randomToken.status
-            eventCountValue.Text = tostring(eventCount)
-            fruitMapValue.Text = tostring(fruitCount)
-            waitBlockValue.Text = tostring(waiting) .. " / " .. tostring(blocked)
-
-            portalValue.Text = short(portal.lastResult, 42)
-            hopValue.Text = short(hop.status, 44)
-
-            targetLabel.Text = short(status, 95)
+            renderDashboard()
         end
     end)
     if not ok then
