@@ -1428,6 +1428,8 @@ local function addPatrolPoint(name, position, source)
     local spawnName = string.lower(tostring(name or ""))
     local bareName = spawnName:gsub("%b[]", ""):gsub("%s+", " "):match("^%s*(.-)%s*$")
     local bossKey = bareName:gsub("magnetized", ""):gsub("[^%w]", "")
+    -- Factory Core markers may have no [Boss] suffix. Never add/merge this stop.
+    if bossKey == "core" or bossKey == "factorycore" then return false end
     if sea == 2 and kingdomOfRoseCamps[bossKey] then return false end
     if spawnName:find("%f[%a]boss%f[%A]") or patrolBossNames[bossKey]
         or bossKey:match("^ripindra") then
@@ -1611,19 +1613,56 @@ local function patrolStep(root, humanoid, dt, now)
     flyTo(root, humanoid, destination, dt)
 end
 
+-- Same Melee/Fighting Style recognition as auto_factory; never substitute a Sword/Fruit.
+local equipState = { character = nil, tool = nil, readyAt = 0, retryAt = 0 }
 local function equip(character, humanoid)
+    local now = os.clock()
+    if equipState.character ~= character then
+        equipState.character, equipState.tool = character, nil
+        equipState.readyAt, equipState.retryAt = 0, 0
+    end
+    if character ~= player.Character or not humanoid or humanoid.Parent ~= character
+        or humanoid.Health <= 0 then return nil, "Character chua san sang" end
+    local function normalize(value)
+        return tostring(value or ""):lower():match("^%s*(.-)%s*$")
+    end
+    local wanted = normalize(config.Weapon)
     local function matches(tool)
-        return tool:IsA("Tool") and (tool.ToolTip == config.Weapon or tool.Name == config.Weapon)
+        if not tool:IsA("Tool") then return false end
+        local tooltip = normalize(tool.ToolTip)
+        if wanted == "melee" or wanted == "fighting style" then
+            return tooltip == "melee" or tooltip == "fighting style"
+        end
+        return tooltip == wanted or normalize(tool.Name) == wanted
     end
     for _, tool in ipairs(character:GetChildren()) do
-        if matches(tool) then return tool end
+        if matches(tool) then
+            if equipState.tool ~= tool then
+                equipState.tool, equipState.readyAt = tool, now + 0.25
+            end
+            if now < equipState.readyAt then return nil, "Cho equip: " .. tool.Name end
+            return tool
+        end
     end
+    -- Losing the equipped tool (Portal, pickup, respawn) requires a new settle window.
+    equipState.tool = nil
     local backpack = player:FindFirstChildOfClass("Backpack")
     if backpack then
         for _, tool in ipairs(backpack:GetChildren()) do
-            if matches(tool) then humanoid:EquipTool(tool); return tool end
+            if matches(tool) then
+                if now < equipState.retryAt then return nil, "Dang equip: " .. tool.Name end
+                equipState.retryAt = now + 0.75
+                local ok = pcall(function() humanoid:EquipTool(tool) end)
+                if not ok then return nil, "Equip that bai: " .. tool.Name end
+                if tool.Parent == character then
+                    equipState.tool, equipState.readyAt = tool, now + 0.25
+                end
+                -- Do not send an attack in the same tick as EquipTool.
+                return nil, "Cho equip: " .. tool.Name
+            end
         end
     end
+    return nil, "Khong tim thay vu khi: " .. tostring(config.Weapon)
 end
 -- Resolver adapted from auto_factory.lua ResolveCombatRemotes/TrySourceMeleeAttack.
 -- Module require may yield: resolve in one background task, never the Heartbeat.
@@ -1665,6 +1704,11 @@ local function resolveCombatRemotes()
     return false
 end
 local function attack(mobRoot, tool)
+    local character = player.Character
+    if not character or not tool or tool.Parent ~= character then
+        return false, "Vu khi chua duoc equip"
+    end
+    if not mobRoot or not mobRoot.Parent then return false, "Muc tieu da bien mat" end
     if not config.AttackNoAnimation then
         local ok, err = pcall(function() tool:Activate() end)
         return ok, ok and "Tool attack" or short(err, 80)
@@ -2192,11 +2236,11 @@ local function farmStep(dt)
     attackClock = attackClock + dt
     if distance <= config.AttackRange and attackClock >= config.AttackInterval then
         attackClock = 0
-        local tool = equip(character, humanoid)
+        local tool, equipDetail = equip(character, humanoid)
         if tool then
             local sent, detail = attack(mobRoot, tool)
             if not sent then status = detail end
-        else status = "Khong tim thay vu khi: " .. config.Weapon end
+        else status = equipDetail or "Cho vu khi san sang" end
     end
 end
 
