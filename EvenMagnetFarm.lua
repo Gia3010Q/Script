@@ -334,7 +334,7 @@ local fruitRecords = setmetatable({}, { __mode = "k" })
 local storeRecords = setmetatable({}, { __mode = "k" })
 local fruitTask = { target = nil, started = nil, best = math.huge, progress = 0 }
 local randomToken = { busy = false, locked = false, retryAt = 0, serial = 0,
-    status = "Tu quay khi du 500 token" }
+    phase = "idle", status = "Tu Check server; quay khi du dieu kien" }
 if type(env.WebhookURL) == "string" then config.WebhookURL = env.WebhookURL end
 local eventWindow = { active = false, cycle = nil, remaining = 0 }
 local function readEventWindow(timestamp)
@@ -1501,6 +1501,8 @@ function api.GetState()
         ownedFruits = #owned, blockedFruits = blocked, waitingStore = waiting,
         portal = portal.lastResult, portalDestination = portal.destination,
         hopChecked = true, hopBusy = false, hopStatus = "Da loai hop o V1",
+        randomStatus = randomToken.status, randomBusy = randomToken.busy,
+        randomLocked = randomToken.locked, randomPhase = randomToken.phase,
         playerCount = #Players:GetPlayers(), session = sessionSerial,
     }
 end
@@ -1822,7 +1824,8 @@ local function startFruitPickup(record, root, humanoid)
     return true
 end
 local function fruitStep(root, humanoid, dt, now)
-    if not config.FruitEnabled then return false end
+    -- Do not misattribute a world pickup to the pending random reward.
+    if not config.FruitEnabled or randomToken.busy then return false end
     local record = fruitTask.target and fruitRecords[fruitTask.target]
     if not record or not record.instance:IsDescendantOf(workspace)
         or not record.part or not record.part.Parent then
@@ -1852,76 +1855,119 @@ local function fruitStep(root, humanoid, dt, now)
     return true
 end
 
-local function randomEventOpen()
-    local ok, now = pcall(function() return workspace:GetServerTimeNow() end)
-    if not ok then now = os.time() end
-    return now % 3600 < 600
+local function randomRequirements(a, b)
+    local function unwrap(value)
+        if type(value) ~= "table" then return nil end
+        if type(value.RequirementsMet) == "boolean" then return value end
+        local nested = value[1] or value["1"]
+        if type(nested) == "table" and type(nested.RequirementsMet) == "boolean" then return nested end
+    end
+    return unwrap(b) or unwrap(a)
 end
--- Check/Purchase schema verified from the user's MagnetRandomTest output.
+-- auto_factory flow: read box -> Check -> Purchase. Server flags, not the hourly
+-- mob schedule or template ErrorMessage strings, decide whether a roll is ready.
+-- Keep the Magnet box/currency/500-token guard from the user's captured response.
 local function randomTokenStep()
     if not alive or not enabled or not config.AutoRandomToken or randomToken.locked
-        or randomToken.busy or action.kind or not randomEventOpen()
-        or hasLiveMagnetized() or os.clock() < randomToken.retryAt then return end
+        or randomToken.busy or os.clock() < randomToken.retryAt then return end
+    if action.kind then randomToken.status = "Cho tac vu: " .. action.kind; return end
+    if hasLiveMagnetized() then randomToken.status = "Uu tien danh Magnetized"; return end
     local character = player.Character
     local hum = character and character:FindFirstChildOfClass("Humanoid")
-    if not hum or hum.Health <= 0 or not currentTeamName()
-        or not character:FindFirstChild("HasBuso") then return end
-    local owned, blocked = getStoreSummary()
-    if #owned > blocked then return end
+    if not hum or hum.Health <= 0 or not currentTeamName() then
+        randomToken.status = "Cho nhan vat/team"; return
+    end
+    if not character:FindFirstChild("HasBuso") then
+        randomToken.status = "Cho Haki Buso"; return
+    end
+    -- Like auto_factory, only an active pickup/store blocks the transaction.
+    -- A held fruit with missing OriginalName must not block random forever.
     local modules = RS:FindFirstChild("Modules")
     local net = modules and modules:FindFirstChild("Net")
     local rf = net and net:FindFirstChild("RF/GachaNetworkRF")
     if not rf or not rf:IsA("RemoteFunction") then
+        randomToken.status = "Cho RF/GachaNetworkRF"
         randomToken.retryAt = os.clock() + 5; return
     end
     randomToken.busy = true
     randomToken.serial = randomToken.serial + 1
-    local serial = randomToken.serial
+    local serial, intent = randomToken.serial, action.token
     local function current()
         return alive and env.EventMagnetFarm == api and randomToken.serial == serial
     end
-    task.delay(12, function()
-        if current() and randomToken.busy then
-            randomToken.locked, randomToken.status = true, "Timeout: khoa random, cho ket qua"
-        end
-    end)
     task.spawn(function()
-        local dispatched = false
+        local dispatched, purchaseResolved = false, false
+        -- Each remote has its own slow-response notice. Never include the reward
+        -- wait in a shared 12s deadline or permanently lock a successful slow read.
+        -- Keep one in-flight request: a timeout alone is not permission to buy again.
+        local function invoke(context)
+            local finished, started = false, os.clock()
+            randomToken.phase = context
+            task.delay(12, function()
+                if current() and randomToken.busy and not finished then
+                    randomToken.status = context .. " cham; cho server, khong gui lap"
+                end
+            end)
+            local a, b = rf:InvokeServer({Context = context, BoxName = "MagnetEventGacha26"})
+            finished = true
+            return a, b, os.clock() - started
+        end
         local ok = pcall(function()
-            local a, b = rf:InvokeServer({Context = "Check", BoxName = "MagnetEventGacha26"})
+            if not current() or not enabled or action.token ~= intent then return end
+            randomToken.status = "Doc du lieu Magnet Gacha"
+            invoke("getGachaFromBoxName")
+            if not current() or not enabled or action.token ~= intent or player.Character ~= character then return end
+            randomToken.status = "Dang Check dieu kien server"
+            local a, b, checkAge = invoke("Check")
             if not current() then return end
-            local req = type(b) == "table" and b or (type(a) == "table" and a)
+            if checkAge > 12 then
+                randomToken.status, randomToken.retryAt = "Check cham; se Check moi", os.clock() + 3
+                return
+            end
+            local req = randomRequirements(a, b)
             local price = req and req.Price
-            if not req or type(req.RequirementsMet) ~= "boolean" or type(price) ~= "table"
-                or tonumber(price.ItemId) ~= 1574 or tonumber(price.Value) ~= 500
-                or type(price.Current) ~= "number" then
-                randomToken.locked, randomToken.status = true, "Du lieu/gia thay doi: dung random"
+            if not req or type(price) ~= "table" then
+                randomToken.status, randomToken.retryAt = "Check chua du du lieu; thu lai", os.clock() + 10
                 return
             end
-            if price.Current < 500 or price.RequirementMet ~= true then
-                randomToken.status, randomToken.retryAt = "Token " .. price.Current .. "/500", os.clock() + 10
+            local tokens = tonumber(price.Current)
+            if tonumber(price.ItemId) ~= 1574 or tonumber(price.Value) ~= 500
+                or not tokens or tokens ~= tokens or math.abs(tokens) == math.huge then
+                randomToken.status, randomToken.retryAt = "Sai/thieu gia Magnet Token; chi Check lai", os.clock() + 30
                 return
             end
-            if req.RequirementsMet ~= true or (type(req.Cooldown) == "table" and req.Cooldown.RequirementMet == false) then
-                randomToken.status, randomToken.retryAt = "Cho cooldown/dieu kien", os.clock() + 3
+            if tokens < 500 or price.RequirementMet == false then
+                randomToken.status, randomToken.retryAt = "Token " .. tokens .. "/500; chua du dieu kien gia", os.clock() + 10
                 return
             end
-            if not enabled or not config.AutoRandomToken or randomToken.locked or not randomEventOpen()
-                or action.kind or hasLiveMagnetized() or player.Character ~= character or hum.Health <= 0 then return end
-            if not character:FindFirstChild("HasBuso") then return end
+            if type(req.Cooldown) == "table" and req.Cooldown.RequirementMet == false then
+                randomToken.status, randomToken.retryAt = "Cho cooldown server", os.clock() + 3
+                return
+            end
+            if req.RequirementsMet ~= true
+                or (type(req.Level) == "table" and req.Level.RequirementMet == false)
+                or (type(req.PaidRandomItemsRestricted) == "table" and req.PaidRandomItemsRestricted.Value == true) then
+                randomToken.status, randomToken.retryAt = "Server chua cho quay; Check lai sau", os.clock() + 10
+                return
+            end
+            if not enabled or not config.AutoRandomToken or randomToken.locked or action.token ~= intent
+                or action.kind or hasLiveMagnetized() or player.Character ~= character or hum.Health <= 0
+                or not character:FindFirstChild("HasBuso") then
+                randomToken.status, randomToken.retryAt = "Du dieu kien; nhuong farm/tac vu, se Check lai", os.clock() + 3
+                return
+            end
             local before = {}
             for _, item in ipairs(ownedFruitTools()) do before[item] = true end
             dispatched = true
             randomToken.status = "Quay 500 Magnet Token"
-            local accepted, details = rf:InvokeServer({Context = "Purchase", BoxName = "MagnetEventGacha26"})
+            local accepted, details = invoke("Purchase")
             if not current() then return end
+            purchaseResolved = type(accepted) == "boolean"
             if accepted == false then
                 randomToken.status, randomToken.retryAt = "Server tu choi; Check lai", os.clock() + 3
                 return
-            elseif accepted ~= true then
-                randomToken.locked, randomToken.status = true, "Purchase chua ro; dung random"
-                return
             end
+            randomToken.phase, randomToken.status = "reward", "Cho Fruit vao balo"
             local rewards = {}
             -- auto_factory waits for a real reward Tool; don't invent a fruit from Purchase=true.
             local rewardDeadline = os.clock() + 8
@@ -1933,8 +1979,13 @@ local function randomTokenStep()
                     if not before[item] then rewards[#rewards + 1] = item.Name end
                 end
             until #rewards > 0 or os.clock() >= rewardDeadline
+            if accepted ~= true and #rewards == 0 then
+                randomToken.locked, randomToken.status = true, "Purchase chua ro; dung de tranh quay trung"
+                return
+            end
+            purchaseResolved = true
             randomToken.status = #rewards > 0 and ("Nhan " .. table.concat(rewards, ", "))
-                or "Server chap nhan; chua thay Fruit"
+                or "Server chap nhan; chua thay Fruit, Check lai sau"
             log("RANDOM", randomToken.status)
             for _, item in ipairs(ownedFruitTools()) do
                 if not before[item] then sendFruitWebhook("Random", item.Name, item, getFruitOriginalName(item)) end
@@ -1943,11 +1994,13 @@ local function randomTokenStep()
         end)
         if not current() then return end
         if not ok then
-            randomToken.locked = dispatched or randomToken.locked
-            randomToken.status = dispatched and "Purchase loi; khoa random" or "Check loi; thu lai sau"
+            randomToken.locked = dispatched and not purchaseResolved
+            randomToken.status = randomToken.locked and "Purchase loi/chua ro; dung de tranh quay trung"
+                or "Loi doc/xu ly Gacha; se Check lai"
             randomToken.retryAt = os.clock() + 10
         end
-        randomToken.busy = false
+        randomToken.busy, randomToken.phase = false, "idle"
+        randomToken.retryAt = math.max(randomToken.retryAt, os.clock() + 1)
     end)
 end
 -- Adapted from giayeuem.lua SourceBringMob: same radius/count/throttle and
